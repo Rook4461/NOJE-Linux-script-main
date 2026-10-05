@@ -1,0 +1,185 @@
+Linux Hardening for CyberPatriot
+
+Core Concept Areas: Effective Linux defense centers on several domains. For example, User Accounts & Authentication (e.g. root/sudo usage, password policies) should be locked down. File System Permissions & Ownership (sticky bits, world‐writable files, SUID/SGID binaries) must be checked. Network Services & Daemons (disable unneeded services like FTP, Telnet, Samba) are a common attack surface. SSH/Remote Access settings (PermitRootLogin, protocols, keys) need hardening. Firewall & Network Configuration (iptables/UFW rules, /etc/hosts.allow/deny, open ports) should be restrictive. Package Management & Updates (unnecessary packages, missing security patches) is critical to avoid known flaws. Below are 30 specific items to check under these areas, each with a detection tip and remediation command.
+Common Vulnerabilities & Fixes
+
+    1. Root SSH Login Enabled: If /etc/ssh/sshd_config has PermitRootLogin yes, remote SSH logins as root are allowed – a high-risk setting. Detect with grep -i permitrootlogin /etc/ssh/sshd_config. Fix by editing this file to PermitRootLogin no and restart SSH (e.g. sudo systemctl restart sshd). Disabling root SSH login forces use of sudo and thwarts trivial brute-force “root” attacks.
+
+    2. Empty Passwords Allowed: Check PermitEmptyPasswords in /etc/ssh/sshd_config. If PermitEmptyPasswords yes, accounts with no password can SSH in. Set PermitEmptyPasswords no and restart SSH. (Also scan /etc/shadow for blank password fields: sudo awk -F: '($2==""){print $1}' /etc/shadow and lock those accounts.)
+
+    3. Root Account Not Locked: Ensure the root account is locked unless needed. On Debian/Ubuntu, root is usually locked (passwd -l root). If grep root /etc/shadow shows a usable hash (not ! or *), lock it with sudo passwd -l root. Always use an unprivileged user plus sudo for tasks.
+
+    4. User Accounts with No Password: Detect empty passwords:
+
+    bash
+    Copy
+
+    sudo awk -F: '($2==""){print $1}' /etc/shadow
+
+    Any listed user has no password. Remedy by setting a password (sudo passwd username) or locking it (sudo passwd -l username).
+
+    5. Excess or Guest Accounts: Remove or disable unnecessary accounts (e.g. guest, ftp, nobody, test). List users via cut -d: -f1 /etc/passwd. For any unused account, either delete (sudo deluser name) or lock it (sudo usermod -L name). Check /etc/sudoers and /etc/sudoers.d/ for NOPASSWD: ALL – remove such entries to ensure sudo prompts for a password.
+
+    6. Sudoers Misconfiguration: If /etc/sudoers or files in /etc/sudoers.d/ contain dangerous lines (e.g. ALL ALL=(ALL) NOPASSWD: ALL), fix them. For example, remove NOPASSWD or restrict the sudo group in /etc/sudoers. Validate with sudo visudo.
+
+    7. World-Writable Directories (Non-root-owned): Find any directory that is world-writable (permissions drwxrwxrwx) and not owned by root or a system user:
+
+    bash
+    Copy
+
+    sudo find / -xdev -type d -perm -0002 ! -user root ! -uid +999 -ls
+
+    If any output appears, it’s a vulnerability. Fix by changing ownership to root (or a dedicated system user) and/or removing write permission. For example:
+
+    bash
+    Copy
+
+    sudo find / -xdev -type d -perm -0002 ! -user root ! -uid +999 -exec chown root:root {} +
+
+    This follows the Amazon Linux STIG guidance to own all public directories by root.
+
+    8. /tmp and /var/tmp Sticky Bit Missing: Both /tmp and /var/tmp should have the sticky bit set so users can’t delete others’ files. Verify with ls -ld /tmp; a secure setting looks like drwxrwxrwt. If the “t” is missing, fix:
+
+    bash
+    Copy
+
+    sudo chmod +t /tmp /var/tmp
+
+    (This prevents unauthorized file deletion in these public directories.)
+
+    9. World-Writable Files: Search for any world-writable file (outside of /tmp):
+
+    bash
+    Copy
+
+    sudo find / -xdev -type f -perm -0002 -ls
+
+    Any such file should generally not be writable by all. For each, remove world-write: sudo chmod o-w filename.
+
+    10. /etc/shadow Permissions: The /etc/shadow file must be readable only by root. Check ls -l /etc/shadow – it should be -rw-------. If not, fix with:
+
+    bash
+    Copy
+
+    sudo chmod 600 /etc/shadow
+    sudo chown root:shadow /etc/shadow
+
+    (Sometimes group shadow or root is used; ensure it’s not world-readable.)
+
+    11. /etc/passwd Permissions: /etc/passwd should be world-readable but not writable. It should look like -rw-r--r--. If it’s writable, remove that permission:
+
+    bash
+    Copy
+
+    sudo chmod 644 /etc/passwd
+    sudo chown root:root /etc/passwd
+
+    12. Home Directory Permissions: Each user’s home (e.g. /home/alice) should not allow “others” full access. Check with ls -ld /home/*; if any show drwxrwxrwx, fix them:
+
+    bash
+    Copy
+
+    sudo chmod 700 /home/username
+
+    so only the owner (and root) can access.
+
+    13. SUID/SGID Files: Find suspicious set-user-ID or set-group-ID binaries:
+
+    bash
+    Copy
+
+    sudo find / -perm /6000 -type f -ls
+
+    Many SUID files are normal (like /usr/bin/sudo), but if you find unusual ones (especially in world-writable directories), remove or correct them. For example, to remove SUID on a file: sudo chmod u-s /path/to/file. (Caution: do not remove SUID from system binaries unless you know it’s unsafe.)
+
+    14. .ssh Directory Permissions: Check each user’s ~/.ssh folder. It should be drwx------ (700) and authorized_keys 600. For any user with weaker perms, run:
+
+    bash
+    Copy
+
+    sudo chmod 700 /home/username/.ssh
+    sudo chmod 600 /home/username/.ssh/authorized_keys
+    sudo chown -R username:username /home/username/.ssh
+
+    15. .rhosts or hosts.equiv Files: These allow passwordless login via RSH/REXEC. Disable by removing them:
+
+    bash
+    Copy
+
+    sudo find /home -name .rhosts -delete
+    sudo rm -f /etc/hosts.equiv /etc/shosts.equiv
+
+    16. SSH Protocol 1 Enabled: Ensure SSH uses only protocol 2 (protocol 1 is insecure). In /etc/ssh/sshd_config, set Protocol 2. (Debian/Ubuntu default is 2.)
+
+    17. SSH Weak Ciphers/MACs: Check Ciphers and MACs in /etc/ssh/sshd_config. Restrict to modern algorithms (e.g. AES only). Example fix: add
+
+    nginx
+    Copy
+
+    Ciphers aes256-ctr,aes192-ctr,aes128-ctr
+    MACs hmac-sha2-512,hmac-sha2-256
+
+    then restart sshd.
+
+    18. Unused Network Services (e.g. Telnet): If Telnet is installed or its port (23) is listening, remove it. Detect with netstat -tulpn | grep :23 or dpkg -l | grep telnet. On Debian/Ubuntu:
+
+    bash
+    Copy
+
+    sudo apt remove -y telnetd xinetd telnet
+
+    (Or on RHEL: sudo yum remove telnet-server xinetd). Telnet sends plain-text passwords and should not be used.
+
+    19. Unused Network Services (e.g. FTP/vsftpd): Check if an FTP server is running: netstat -tulpn | grep ftp or dpkg -l | grep vsftpd. If it’s not needed, remove it (sudo apt remove -y vsftpd). If needed, secure it: edit /etc/vsftpd.conf and ensure anonymous_enable=NO. For example, if /etc/vsftpd.conf contains anonymous_enable=YES, that is a risk. Set anonymous_enable=NO and disable anonymous uploads (anon_upload_enable=NO), then restart vsftpd.
+
+    20. vsftpd Backdoor (older versions): Very old vsftpd (like 2.3.4) had a backdoor. If the image uses an outdated version, remove the package. Generally, remove FTP unless needed.
+
+    21. Samba (SMB) Shares: If Samba is installed (dpkg -l | grep samba), check /etc/samba/smb.conf for guest shares or insecure permissions (e.g. guest ok = yes). If you don’t need SMB, uninstall: sudo apt remove -y samba. If SMB is needed, ensure security = user and disable guest access (guest ok = no) and remove any “world-writable” shares.
+
+    22. SNMP or other legacy services: Ensure services like SNMP (net-snmp), RPC, or NFS aren’t running unless required. Use netstat -tulpn or systemctl list-unit-files | grep enabled to spot unexpected daemons. Disable unwanted ones: e.g. sudo systemctl disable snmpd.
+
+    23. Web Server (Apache/Nginx): If a web server is running, remove default pages and disable directory listing. For Apache, ensure /etc/apache2/conf-enabled/security.conf has ServerTokens Prod and ServerSignature Off. Check for .htaccess that allows too much. If not needed, stop it: sudo systemctl disable --now apache2 (Debian) or httpd (RHEL).
+
+    24. Mail Server (Postfix/Exim): If an MTA is present, ensure it’s not an open relay. Test by trying to mail to an external domain:
+
+    bash
+    Copy
+
+    telnet localhost 25
+
+    and see if it accepts mail from unauthorized domains. If it is open, reconfigure (e.g. in /etc/postfix/main.cf restrict mynetworks). If mail is not needed, uninstall the MTA (sudo apt remove -y postfix exim4).
+
+    25. NFS Shares: If /etc/exports has NFS shares, ensure root_squash is enabled and hosts are restricted. For security, remove NFS exports if not used: sudo exportfs -ua and stop the service (sudo systemctl disable --now nfs-server).
+
+    26. iptables/UFW Default Allow: By default many Linux distros allow all traffic. Set a restrictive firewall. For example, with UFW:
+
+    bash
+    Copy
+
+    sudo apt install ufw
+    sudo ufw default deny incoming
+    sudo ufw default allow outgoing
+    sudo ufw enable
+
+    Then explicitly allow only needed ports (e.g. sudo ufw allow 22). A good firewall reduces attack surface.
+
+    27. Unrestricted Root Access: In /etc/hosts.allow, you can limit which hosts can use services like SSH, login, etc. For example, adding sshd: 192.168.0.0/24 and ALL: NONE in /etc/hosts.allow/hosts.deny can block unauthorized hosts.
+
+    28. IPv6 Misconfiguration: If IPv6 is not in use, disable it in /etc/sysctl.conf:
+
+    ini
+    Copy
+
+    net.ipv6.conf.all.disable_ipv6 = 1
+    net.ipv6.conf.default.disable_ipv6 = 1
+
+    and sudo sysctl -p. (This prevents IPv6-based attacks if IPv6 isn’t needed.)
+
+    29. Unpatched System: Run sudo apt update && sudo apt list --upgradable to check for outdated packages. If many updates exist, apply them (sudo apt upgrade -y). Unpatched software is a common vulnerability.
+
+    30. Unnecessary Packages: Use dpkg -l (or rpm -qa) to list installed software. Remove anything not needed: for example, remove compilers on a server (sudo apt purge -y gcc g++ make) or desktop environments (sudo apt remove -y gnome-shell on Ubuntu server). Fewer packages mean fewer potential flaws.
+
+Each check above should be verified on your image. Where settings are changed, always restart or reload the affected service (e.g. sudo systemctl restart sshd for SSH changes). These steps – derived from Linux hardening guides and best practices – cover typical CyberPatriot vulnerabilities.
+
+
+MOre bnig texy update pleae
