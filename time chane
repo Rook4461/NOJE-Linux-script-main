@@ -19,3 +19,5 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 date -s "$1"
+update
+update 333
