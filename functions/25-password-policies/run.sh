@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Configure the Debian/Ubuntu password-quality policy and update non-admin
-# interactive human accounts selected by the system account database.
+# Configure the Debian/Ubuntu password-quality policy and optionally update
+# each interactive human account selected by the operator.
 
 set -u
 
@@ -93,47 +93,52 @@ printf '  Minimum numbers: 1\n'
 printf '  Minimum special characters: 1\n'
 
 declare -a target_users=()
-declare -a admin_users=()
 while IFS=: read -r account _ uid _ _ _ shell; do
     [[ "$uid" =~ ^[0-9]+$ ]] || continue
     ((uid >= 1000)) || continue
     is_human_account "$account" || continue
-
-    if is_admin_account "$account"; then
-        admin_users+=("$account")
-    else
-        target_users+=("$account")
-    fi
+    target_users+=("$account")
 done < <(getent passwd)
 
-printf '\nAdministrator accounts excluded:\n'
-printf '  root\n'
-if ((${#admin_users[@]} > 0)); then
-    printf '  %s\n' "${admin_users[@]}"
-fi
-
 if ((${#target_users[@]} == 0)); then
-    printf '\nNo eligible non-administrator human accounts were found.\n'
+    printf '\nNo eligible human login accounts were found.\n'
     exit 0
 fi
 
-printf '\nAccounts that will receive the competition password:\n'
+printf '\nHuman login accounts found:\n'
 printf '  %s\n' "${target_users[@]}"
-printf '\nType APPLY to set the password for these accounts, or anything else to cancel: '
-IFS= read -r confirmation || true
-
-if [[ "$confirmation" != 'APPLY' ]]; then
-    printf 'Password updates cancelled.\n'
-    exit 0
-fi
 
 default_password='1P@ssword!'
 failures=0
+updated=0
 for account in "${target_users[@]}"; do
-    if printf '%s:%s\n' "$account" "$default_password" | chpasswd; then
-        printf 'Password updated for %s.\n' "$account"
-    else
+    role=''
+    if is_admin_account "$account"; then
+        role=' (administrator)'
+    fi
+
+    printf '\nChange password for %s%s? [y/N]: ' "$account" "$role"
+    IFS= read -r answer || true
+    case "$answer" in
+        y|Y|yes|YES)
+            ;;
+        *)
+            printf 'Skipped %s.\n' "$account"
+            continue
+            ;;
+    esac
+
+    if ! printf '%s:%s\n' "$account" "$default_password" | chpasswd; then
         printf 'Unable to update password for %s.\n' "$account" >&2
+        failures=$((failures + 1))
+        continue
+    fi
+
+    if chage -d 0 "$account"; then
+        printf 'Password updated for %s and marked for reset at next login.\n' "$account"
+        updated=$((updated + 1))
+    else
+        printf 'Password updated for %s, but it could not be marked for reset.\n' "$account" >&2
         failures=$((failures + 1))
     fi
 done
@@ -143,4 +148,4 @@ if ((failures > 0)); then
     fail "$failures password update(s) failed."
 fi
 
-printf '\nPassword updates completed for all eligible non-administrator accounts.\n'
+printf '\nPassword updates completed for %d account(s).\n' "$updated"
