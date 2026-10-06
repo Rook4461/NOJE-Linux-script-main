@@ -61,99 +61,166 @@ printf '=== Password Policy Setup ===\n\n'
 
 ((EUID == 0)) || fail 'Run this plugin as root, for example: sudo bash The_Script.sh'
 
-if [[ ! -r /etc/os-release ]] || ! grep -Eq '^(ID|ID_LIKE)=(ubuntu|debian|.*debian.*)' /etc/os-release; then
-    fail 'This implementation supports Ubuntu/Debian systems only.'
-fi
-
-declare -a target_users=()
-while IFS=: read -r account _ uid _ _ _ shell; do
-    [[ "$uid" =~ ^[0-9]+$ ]] || continue
-    ((uid >= 1000)) || continue
-    is_human_account "$account" || continue
-    target_users+=("$account")
-done < <(getent passwd)
-
-if ((${#target_users[@]} == 0)); then
-    printf '\nNo eligible human login accounts were found.\n'
-    exit 0
-fi
-
-printf '\nHuman login accounts found:\n'
-printf '  %s\n' "${target_users[@]}"
-
+declare -a human_users=()
+declare -a admin_users=()
+declare -a candidate_users=()
 declare -a selected_users=()
-for account in "${target_users[@]}"; do
-    role=''
-    if is_admin_account "$account"; then
-        role=' (administrator)'
+
+collect_human_users() {
+    human_users=()
+    while IFS=: read -r account _ uid _ _ _ shell; do
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        ((uid >= 1000)) || continue
+        is_human_account "$account" || continue
+        human_users+=("$account")
+    done < <(getent passwd)
+}
+
+collect_admin_users() {
+    admin_users=()
+    while IFS=: read -r account _ uid _ _ _ shell; do
+        if [[ "$account" == 'root' ]]; then
+            admin_users+=("$account")
+        elif [[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1000)) && is_human_account "$account" && is_admin_account "$account"; then
+            admin_users+=("$account")
+        fi
+    done < <(getent passwd)
+}
+
+apply_general_policy() {
+    if [[ ! -r /etc/os-release ]] || ! grep -Eq '^(ID|ID_LIKE)=(ubuntu|debian|.*debian.*)' /etc/os-release; then
+        fail 'This implementation supports Ubuntu/Debian systems only.'
     fi
 
-    printf '\nApply the password policy and change the password for %s%s? [y/N]: ' "$account" "$role"
-    IFS= read -r answer || true
-    case "$answer" in
-        y|Y|yes|YES)
-            selected_users+=("$account")
+    [[ -f "$PWQUALITY_FILE" ]] || fail "$PWQUALITY_FILE does not exist. Install libpam-pwquality first."
+    [[ -f "$PAM_FILE" ]] || fail "$PAM_FILE does not exist."
+
+    if ! find /lib /usr/lib -name pam_pwquality.so -print -quit 2>/dev/null | grep -q .; then
+        fail 'pam_pwquality is unavailable. Install libpam-pwquality first.'
+    fi
+
+    backup_file "$PWQUALITY_FILE"
+    backup_file "$PAM_FILE"
+
+    set_pwquality_value 'minlen' '10'
+    set_pwquality_value 'dcredit' '-1'
+    set_pwquality_value 'ocredit' '-1'
+
+    if ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' "$PAM_FILE"; then
+        if grep -Eq '^[[:space:]]*password[[:space:]].*pam_unix\.so' "$PAM_FILE"; then
+            sed -i '/^[[:space:]]*password[[:space:]].*pam_unix\.so/i password requisite pam_pwquality.so retry=3' "$PAM_FILE"
+        else
+            fail "Could not find a pam_unix password rule in $PAM_FILE."
+        fi
+    fi
+
+    collect_human_users
+    printf '\nPolicy configured for %d human user(s):\n' "${#human_users[@]}"
+    printf '  Minimum length: 10\n'
+    printf '  Minimum numbers: 1\n'
+    printf '  Minimum special characters: 1\n'
+}
+
+update_selected_passwords() {
+    if ((${#selected_users[@]} == 0)); then
+        printf '\nNo accounts selected. No passwords were changed.\n'
+        return 0
+    fi
+
+    local default_password='1P@ssword!'
+    local failures=0
+    local updated=0
+    local account
+
+    for account in "${selected_users[@]}"; do
+        if ! printf '%s:%s\n' "$account" "$default_password" | chpasswd; then
+            printf 'Unable to update password for %s.\n' "$account" >&2
+            failures=$((failures + 1))
+            continue
+        fi
+
+        if chage -d 0 "$account"; then
+            printf 'Password updated for %s and marked for reset at next login.\n' "$account"
+            updated=$((updated + 1))
+        else
+            printf 'Password updated for %s, but it could not be marked for reset.\n' "$account" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    if ((failures > 0)); then
+        fail "$failures password update(s) failed."
+    fi
+
+    printf '\nPassword updates completed for %d account(s).\n' "$updated"
+}
+
+prompt_for_password_changes() {
+    selected_users=()
+    for account in "${candidate_users[@]}"; do
+        role=''
+        if is_admin_account "$account"; then
+            role=' (administrator)'
+        fi
+
+        printf '\nChange password for %s%s? [y/N]: ' "$account" "$role"
+        IFS= read -r answer || true
+        case "$answer" in
+            y|Y|yes|YES)
+                selected_users+=("$account")
+                ;;
+            *)
+                printf 'Skipped %s.\n' "$account"
+                ;;
+        esac
+    done
+    update_selected_passwords
+}
+
+pause_menu() {
+    printf '\nPress Enter to return to the password policy menu...'
+    IFS= read -r _ || true
+}
+
+while true; do
+    printf '\n=== Password Policies ===\n'
+    printf '1) Apply general password policy\n'
+    printf '2) Pwd change\n'
+    printf '3) Change admin pwd\n'
+    printf '0) Back\n'
+    printf 'Select an option: '
+    IFS= read -r choice || break
+
+    case "$choice" in
+        1)
+            apply_general_policy
+            pause_menu
+            ;;
+        2)
+            collect_human_users
+            candidate_users=("${human_users[@]-}")
+            if ((${#candidate_users[@]} == 0)); then
+                printf '\nNo eligible human login accounts were found.\n'
+            else
+                prompt_for_password_changes
+            fi
+            pause_menu
+            ;;
+        3)
+            collect_admin_users
+            candidate_users=("${admin_users[@]-}")
+            if ((${#candidate_users[@]} == 0)); then
+                printf '\nNo administrator accounts were found.\n'
+            else
+                prompt_for_password_changes
+            fi
+            pause_menu
+            ;;
+        0|q|Q)
+            break
             ;;
         *)
-            printf 'Skipped %s; no policy or password change will be applied.\n' "$account"
+            printf 'Invalid selection. Choose 1, 2, 3, or 0.\n'
             ;;
     esac
 done
-
-if ((${#selected_users[@]} == 0)); then
-    printf '\nNo accounts selected. No password policy or password changes were made.\n'
-    exit 0
-fi
-
-[[ -f "$PWQUALITY_FILE" ]] || fail "$PWQUALITY_FILE does not exist. Install libpam-pwquality first."
-[[ -f "$PAM_FILE" ]] || fail "$PAM_FILE does not exist."
-
-if ! find /lib /usr/lib -name pam_pwquality.so -print -quit 2>/dev/null | grep -q .; then
-    fail 'pam_pwquality is unavailable. Install libpam-pwquality first.'
-fi
-
-backup_file "$PWQUALITY_FILE"
-backup_file "$PAM_FILE"
-
-set_pwquality_value 'minlen' '10'
-set_pwquality_value 'dcredit' '-1'
-set_pwquality_value 'ocredit' '-1'
-
-if ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' "$PAM_FILE"; then
-    if grep -Eq '^[[:space:]]*password[[:space:]].*pam_unix\.so' "$PAM_FILE"; then
-        sed -i '/^[[:space:]]*password[[:space:]].*pam_unix\.so/i password requisite pam_pwquality.so retry=3' "$PAM_FILE"
-    else
-        fail "Could not find a pam_unix password rule in $PAM_FILE."
-    fi
-fi
-
-printf '\nPolicy configured for selected password changes:\n'
-printf '  Minimum length: 10\n'
-printf '  Minimum numbers: 1\n'
-printf '  Minimum special characters: 1\n'
-
-default_password='1P@ssword!'
-failures=0
-updated=0
-for account in "${selected_users[@]}"; do
-    if ! printf '%s:%s\n' "$account" "$default_password" | chpasswd; then
-        printf 'Unable to update password for %s.\n' "$account" >&2
-        failures=$((failures + 1))
-        continue
-    fi
-
-    if chage -d 0 "$account"; then
-        printf 'Password updated for %s and marked for reset at next login.\n' "$account"
-        updated=$((updated + 1))
-    else
-        printf 'Password updated for %s, but it could not be marked for reset.\n' "$account" >&2
-        failures=$((failures + 1))
-    fi
-done
-unset default_password
-
-if ((failures > 0)); then
-    fail "$failures password update(s) failed."
-fi
-
-printf '\nPassword updates completed for %d account(s).\n' "$updated"
