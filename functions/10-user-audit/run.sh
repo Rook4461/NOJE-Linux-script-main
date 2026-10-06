@@ -123,12 +123,14 @@ print_user_list() {
     printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' 'USER' 'UID' 'TYPE' 'GROUPS' 'ADMIN' 'PASSWORD' 'STATUS'
     printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' '------------------' '--------' '--------' '------------------------' '--------' '------------' '------------'
 
+    local -a admin_users=()
+    local -a regular_users=()
+    local user groups_list admin_flag password_flag account_state user_type
+
     while IFS=: read -r user _ uid _ _ home shell; do
         [[ -n "$user" ]] || continue
 
-        local groups_list admin_flag password_flag account_state user_type
         user_type="$(get_user_type "$user")"
-
         if [[ "$user_type" != "human" && "$user_type" != "root" ]]; then
             continue
         fi
@@ -136,15 +138,22 @@ print_user_list() {
         groups_list="$(id -nG "$user" 2>/dev/null || echo 'unknown')"
         if is_admin_user "$user"; then
             admin_flag='YES'
+            admin_users+=("$user|$uid|$user_type|$groups_list|$admin_flag|$(get_password_state "$user")|$(get_account_status "$user")")
         else
             admin_flag='NO'
+            regular_users+=("$user|$uid|$user_type|$groups_list|$admin_flag|$(get_password_state "$user")|$(get_account_status "$user")")
         fi
-
-        password_flag="$(get_password_state "$user")"
-        account_state="$(get_account_status "$user")"
-
-        printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' "$user" "$uid" "$user_type" "${groups_list// /,}" "$admin_flag" "$password_flag" "$account_state"
     done < <(get_passwd_entries)
+
+    for entry in "${admin_users[@]}"; do
+        IFS='|' read -r user uid user_type groups_list admin_flag password_flag account_state <<< "$entry"
+        printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' "$user" "$uid" "$user_type" "${groups_list// /,}" "$admin_flag" "$password_flag" "$account_state"
+    done
+
+    for entry in "${regular_users[@]}"; do
+        IFS='|' read -r user uid user_type groups_list admin_flag password_flag account_state <<< "$entry"
+        printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' "$user" "$uid" "$user_type" "${groups_list// /,}" "$admin_flag" "$password_flag" "$account_state"
+    done
 }
 
 show_user_details() {
