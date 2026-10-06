@@ -84,10 +84,11 @@ get_account_status() {
 
 get_user_type() {
     local user="$1"
-    local uid home_dir
+    local uid home_dir shell_path
 
     uid="$(get_user_passwd_entry "$user" | cut -d: -f3 || echo 0)"
     home_dir="$(get_user_passwd_entry "$user" | cut -d: -f6 || true)"
+    shell_path="$(get_user_passwd_entry "$user" | cut -d: -f7 || true)"
 
     if [[ -z "$uid" ]]; then
         printf 'unknown'
@@ -99,8 +100,18 @@ get_user_type() {
         return
     fi
 
-    if [[ "$uid" -ge 1000 ]] || [[ "$home_dir" == /home/* ]] || [[ "$home_dir" == /Users/* ]]; then
+    if [[ "$shell_path" == *nologin* || "$shell_path" == *false* || "$shell_path" == *sync* || "$shell_path" == *halt* || "$shell_path" == *shutdown* ]]; then
+        printf 'system'
+        return
+    fi
+
+    if [[ "$uid" -ge 1000 ]] && { [[ "$home_dir" == /home/* ]] || [[ "$home_dir" == /Users/* ]] || [[ -n "$home_dir" ]]; }; then
         printf 'human'
+        return
+    fi
+
+    if [[ "$uid" -lt 1000 ]]; then
+        printf 'system'
         return
     fi
 
