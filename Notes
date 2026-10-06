@@ -1,3 +1,4 @@
------------#used for notes about okcup and cyberpatriot competitions-------------------
+#-----------used for notes about okcup and cyberpatriot competitions--------------------------------------------------------
+#-----------quotation marks (") are actual part of commands, use apostrophes (') for actual quotation in this note----------
 
-Spectre: round 1 okcup will mess with you by changing your password at the beginning, should be able to fix by using other users admin credentials?
+Spectre: round 1 okcup will mess with you by changing your password at the beginning, should fix by logging in as another user with sudo privelages and changing it: 'su zelda', 'sudo passwd link'.
