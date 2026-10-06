@@ -7,3 +7,6 @@ Round 1 okcup 25-26 ubuntu:
   Spectre: remove user ganon
   Spectre: using bashrc check, ruto is the one that is compromised, he is the answer to the forensics question
   Spectre: forensics questions need to be entered like Answer: ruto, not Answer: <ruto>
+
+sqlmap apt package has been removed	3	Unwanted Software
+john apt package has been removed	3	Unwanted Software
