@@ -6,6 +6,8 @@ set -u
 
 PWQUALITY_FILE='/etc/security/pwquality.conf'
 PAM_FILE='/etc/pam.d/common-password'
+LOGIN_DEFS_FILE='/etc/login.defs'
+PASSWORD_RECORD_FILE='/root/noje-password-record.txt'
 
 fail() {
     printf 'Error: %s\n' "$1" >&2
@@ -29,6 +31,29 @@ set_pwquality_value() {
     else
         printf '%s = %s\n' "$key" "$value" >> "$PWQUALITY_FILE"
     fi
+}
+
+set_login_defs_value() {
+    local key="$1"
+    local value="$2"
+
+    if grep -Eq "^[[:space:]]*${key}[[:space:]]+" "$LOGIN_DEFS_FILE"; then
+        sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key}        ${value}|" "$LOGIN_DEFS_FILE"
+    else
+        printf '%s        %s\n' "$key" "$value" >> "$LOGIN_DEFS_FILE"
+    fi
+}
+
+record_password_change() {
+    local account="$1"
+    local password="$2"
+
+    if [[ ! -e "$PASSWORD_RECORD_FILE" ]]; then
+        umask 077
+        printf '# NOJE password record; protect this file and destroy it after the competition.\n' > "$PASSWORD_RECORD_FILE" || return 1
+    fi
+    chmod 600 "$PASSWORD_RECORD_FILE" || return 1
+    printf '%s\t%s\t%s\n' "$(date --iso-8601=seconds)" "$account" "$password" >> "$PASSWORD_RECORD_FILE"
 }
 
 is_human_account() {
@@ -94,6 +119,7 @@ apply_general_policy() {
 
     [[ -f "$PWQUALITY_FILE" ]] || fail "$PWQUALITY_FILE does not exist. Install libpam-pwquality first."
     [[ -f "$PAM_FILE" ]] || fail "$PAM_FILE does not exist."
+    [[ -f "$LOGIN_DEFS_FILE" ]] || fail "$LOGIN_DEFS_FILE does not exist."
 
     if ! find /lib /usr/lib -name pam_pwquality.so -print -quit 2>/dev/null | grep -q .; then
         fail 'pam_pwquality is unavailable. Install libpam-pwquality first.'
@@ -101,10 +127,12 @@ apply_general_policy() {
 
     backup_file "$PWQUALITY_FILE"
     backup_file "$PAM_FILE"
+    backup_file "$LOGIN_DEFS_FILE"
 
     set_pwquality_value 'minlen' '10'
     set_pwquality_value 'dcredit' '-1'
     set_pwquality_value 'ocredit' '-1'
+    set_login_defs_value 'PASS_MAX_DAYS' '90'
 
     if ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' "$PAM_FILE"; then
         if grep -Eq '^[[:space:]]*password[[:space:]].*pam_unix\.so' "$PAM_FILE"; then
@@ -119,6 +147,22 @@ apply_general_policy() {
     printf '  Minimum length: 10\n'
     printf '  Minimum numbers: 1\n'
     printf '  Minimum special characters: 1\n'
+    printf '  Default maximum password age: 90 days\n'
+
+    printf '\nHuman accounts without a password or with a locked password:\n'
+    local account password_state
+    local unprotected_count=0
+    while IFS=: read -r account _ uid _ _ _ shell; do
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        ((uid >= 1000)) || continue
+        is_human_account "$account" || continue
+        password_state="$(passwd -S "$account" 2>/dev/null | awk '{ print $2 }')"
+        if [[ "$password_state" == 'NP' || "$password_state" == 'L' || "$password_state" == 'LK' || -z "$password_state" ]]; then
+            printf '  %s (%s)\n' "$account" "${password_state:-unknown}"
+            unprotected_count=$((unprotected_count + 1))
+        fi
+    done < <(getent passwd)
+    ((unprotected_count == 0)) && printf '  None found.\n'
 }
 
 update_selected_passwords() {
@@ -137,6 +181,11 @@ update_selected_passwords() {
             printf 'Unable to update password for %s.\n' "$account" >&2
             failures=$((failures + 1))
             continue
+        fi
+
+        if ! record_password_change "$account" "$default_password"; then
+            printf 'Password changed for %s, but the password record could not be written.\n' "$account" >&2
+            failures=$((failures + 1))
         fi
 
         if chage -d 0 "$account"; then

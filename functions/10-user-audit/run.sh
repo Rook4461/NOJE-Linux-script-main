@@ -7,6 +7,29 @@
 set -u
 IFS=$'\n\t'
 
+AUTHORIZED_ADMIN_USERS=(link zelda impa urbosa darunia)
+AUTHORIZED_USERS=(tingle beedle groose malon ruto sidon midna rauru teba mipha paya skullkid anju dampe kingrhoam saria epona linebeck purah tatl)
+
+is_authorized_user() {
+    local target="$1"
+    local user
+
+    for user in "${AUTHORIZED_ADMIN_USERS[@]}" "${AUTHORIZED_USERS[@]}"; do
+        [[ "$target" == "$user" ]] && return 0
+    done
+    return 1
+}
+
+is_authorized_admin() {
+    local target="$1"
+    local user
+
+    for user in "${AUTHORIZED_ADMIN_USERS[@]}"; do
+        [[ "$target" == "$user" ]] && return 0
+    done
+    return 1
+}
+
 warn_high_risk() {
     printf '\n*** WARNING: This script can permanently change accounts and authentication. ***\n'
     printf 'Deleting a user, resetting a password, or removing sudo access is a real system action.\n'
@@ -174,6 +197,11 @@ remove_admin_rights() {
     local group
     local removal_made=0
 
+    if is_authorized_admin "$user"; then
+        printf 'Refusing to remove administrator rights from authorized administrator %s.\n' "$user"
+        return 1
+    fi
+
     printf 'Removing admin rights from %s...\n' "$user"
     for group in sudo wheel adm admin; do
         if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$group"; then
@@ -196,6 +224,11 @@ remove_admin_rights() {
 delete_user_account() {
     local user="$1"
     local confirm
+
+    if is_authorized_user "$user"; then
+        printf 'Refusing to delete authorized account %s or its home directory.\n' "$user"
+        return 1
+    fi
 
     printf '\nThis is destructive. %s will be deleted from the system and their home directory may be removed.\n' "$user"
     read -r -p "Type '$user' to confirm deletion, or press Enter to cancel: " confirm

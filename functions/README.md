@@ -30,7 +30,7 @@ Put the plugin's implementation in its own Bash script. It is started as a separ
 
 The `_template` directory contains an unlisted placeholder. Copy it to a new non-underscore directory, then change the name and description. Do not edit `The_Script.sh` to register plugins.
 
-The numbered directories currently in this folder cover user auditing, password policy setup, system security review, malware review, and software review. Some remain starter entries; each can be implemented independently without changing the menu.
+The numbered directories currently in this folder cover user auditing, password policy setup, system security review, malware review, and software review. Each plugin can be run independently without changing the menu.
 
 ## Framework behavior
 
