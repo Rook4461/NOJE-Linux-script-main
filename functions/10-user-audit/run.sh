@@ -82,15 +82,57 @@ get_account_status() {
     fi
 }
 
+get_user_type() {
+    local user="$1"
+    local uid home_dir shell_path
+
+    uid="$(get_user_passwd_entry "$user" | cut -d: -f3 || echo 0)"
+    home_dir="$(get_user_passwd_entry "$user" | cut -d: -f6 || true)"
+    shell_path="$(get_user_passwd_entry "$user" | cut -d: -f7 || true)"
+
+    if [[ -z "$uid" ]]; then
+        printf 'unknown'
+        return
+    fi
+
+    if [[ "$uid" == "0" ]]; then
+        printf 'root'
+        return
+    fi
+
+    if [[ "$shell_path" == *nologin* || "$shell_path" == *false* || "$shell_path" == *sync* || "$shell_path" == *halt* || "$shell_path" == *shutdown* ]]; then
+        printf 'system'
+        return
+    fi
+
+    if [[ "$uid" -ge 1000 ]] && { [[ "$home_dir" == /home/* ]] || [[ "$home_dir" == /Users/* ]] || [[ -n "$home_dir" ]]; }; then
+        printf 'human'
+        return
+    fi
+
+    if [[ "$uid" -lt 1000 ]]; then
+        printf 'system'
+        return
+    fi
+
+    printf 'system'
+}
+
 print_user_list() {
-    printf '\n=== User Inventory ===\n'
-    printf '%-18s %-8s %-24s %-8s %-12s %-12s\n' 'USER' 'UID' 'GROUPS' 'ADMIN' 'PASSWORD' 'STATUS'
-    printf '%-18s %-8s %-24s %-8s %-12s %-12s\n' '------------------' '--------' '------------------------' '--------' '------------' '------------'
+    printf '\n=== Human and Administrative Accounts ===\n'
+    printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' 'USER' 'UID' 'TYPE' 'GROUPS' 'ADMIN' 'PASSWORD' 'STATUS'
+    printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' '------------------' '--------' '--------' '------------------------' '--------' '------------' '------------'
 
     while IFS=: read -r user _ uid _ _ home shell; do
         [[ -n "$user" ]] || continue
 
-        local groups_list admin_flag password_flag account_state
+        local groups_list admin_flag password_flag account_state user_type
+        user_type="$(get_user_type "$user")"
+
+        if [[ "$user_type" != "human" && "$user_type" != "root" ]]; then
+            continue
+        fi
+
         groups_list="$(id -nG "$user" 2>/dev/null || echo 'unknown')"
         if is_admin_user "$user"; then
             admin_flag='YES'
@@ -101,7 +143,7 @@ print_user_list() {
         password_flag="$(get_password_state "$user")"
         account_state="$(get_account_status "$user")"
 
-        printf '%-18s %-8s %-24s %-8s %-12s %-12s\n' "$user" "$uid" "${groups_list// /,}" "$admin_flag" "$password_flag" "$account_state"
+        printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' "$user" "$uid" "$user_type" "${groups_list// /,}" "$admin_flag" "$password_flag" "$account_state"
     done < <(get_passwd_entries)
 }
 
