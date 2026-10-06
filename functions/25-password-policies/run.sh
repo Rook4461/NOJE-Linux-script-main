@@ -65,6 +65,46 @@ if [[ ! -r /etc/os-release ]] || ! grep -Eq '^(ID|ID_LIKE)=(ubuntu|debian|.*debi
     fail 'This implementation supports Ubuntu/Debian systems only.'
 fi
 
+declare -a target_users=()
+while IFS=: read -r account _ uid _ _ _ shell; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    ((uid >= 1000)) || continue
+    is_human_account "$account" || continue
+    target_users+=("$account")
+done < <(getent passwd)
+
+if ((${#target_users[@]} == 0)); then
+    printf '\nNo eligible human login accounts were found.\n'
+    exit 0
+fi
+
+printf '\nHuman login accounts found:\n'
+printf '  %s\n' "${target_users[@]}"
+
+declare -a selected_users=()
+for account in "${target_users[@]}"; do
+    role=''
+    if is_admin_account "$account"; then
+        role=' (administrator)'
+    fi
+
+    printf '\nApply the password policy and change the password for %s%s? [y/N]: ' "$account" "$role"
+    IFS= read -r answer || true
+    case "$answer" in
+        y|Y|yes|YES)
+            selected_users+=("$account")
+            ;;
+        *)
+            printf 'Skipped %s; no policy or password change will be applied.\n' "$account"
+            ;;
+    esac
+done
+
+if ((${#selected_users[@]} == 0)); then
+    printf '\nNo accounts selected. No password policy or password changes were made.\n'
+    exit 0
+fi
+
 [[ -f "$PWQUALITY_FILE" ]] || fail "$PWQUALITY_FILE does not exist. Install libpam-pwquality first."
 [[ -f "$PAM_FILE" ]] || fail "$PAM_FILE does not exist."
 
@@ -87,47 +127,15 @@ if ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' "$PAM_FILE";
     fi
 fi
 
-printf '\nPolicy configured:\n'
+printf '\nPolicy configured for selected password changes:\n'
 printf '  Minimum length: 10\n'
 printf '  Minimum numbers: 1\n'
 printf '  Minimum special characters: 1\n'
 
-declare -a target_users=()
-while IFS=: read -r account _ uid _ _ _ shell; do
-    [[ "$uid" =~ ^[0-9]+$ ]] || continue
-    ((uid >= 1000)) || continue
-    is_human_account "$account" || continue
-    target_users+=("$account")
-done < <(getent passwd)
-
-if ((${#target_users[@]} == 0)); then
-    printf '\nNo eligible human login accounts were found.\n'
-    exit 0
-fi
-
-printf '\nHuman login accounts found:\n'
-printf '  %s\n' "${target_users[@]}"
-
 default_password='1P@ssword!'
 failures=0
 updated=0
-for account in "${target_users[@]}"; do
-    role=''
-    if is_admin_account "$account"; then
-        role=' (administrator)'
-    fi
-
-    printf '\nChange password for %s%s? [y/N]: ' "$account" "$role"
-    IFS= read -r answer || true
-    case "$answer" in
-        y|Y|yes|YES)
-            ;;
-        *)
-            printf 'Skipped %s.\n' "$account"
-            continue
-            ;;
-    esac
-
+for account in "${selected_users[@]}"; do
     if ! printf '%s:%s\n' "$account" "$default_password" | chpasswd; then
         printf 'Unable to update password for %s.\n' "$account" >&2
         failures=$((failures + 1))
