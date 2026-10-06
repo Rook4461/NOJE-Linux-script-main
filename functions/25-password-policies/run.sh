@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Configure the Debian/Ubuntu password-quality policy and optionally update one
-# interactive human account selected by the operator.
+# Configure the Debian/Ubuntu password-quality policy and update non-admin
+# interactive human accounts selected by the system account database.
 
 set -u
 
@@ -42,6 +42,21 @@ is_human_account() {
     [[ "$shell" != '/usr/sbin/nologin' && "$shell" != '/sbin/nologin' && "$shell" != '/bin/false' && "$shell" != '/usr/bin/false' ]]
 }
 
+is_admin_account() {
+    local account="$1"
+    local group
+    local groups
+
+    [[ "$account" == 'root' ]] && return 0
+    groups="$(id -nG "$account" 2>/dev/null)" || return 1
+    for group in $groups; do
+        case "$group" in
+            sudo|admin|wheel) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 printf '=== Password Policy Setup ===\n\n'
 
 ((EUID == 0)) || fail 'Run this plugin as root, for example: sudo bash The_Script.sh'
@@ -77,17 +92,55 @@ printf '  Minimum length: 10\n'
 printf '  Minimum numbers: 1\n'
 printf '  Minimum special characters: 1\n'
 
-printf '\nVerified human accounts available for password update:\n'
-getent passwd | awk -F: '$3 >= 1000 && $7 !~ /(nologin|false)$/ { print "  " $1 }'
-printf '\nEnter one username to update, or press Enter to skip: '
-IFS= read -r username || true
+declare -a target_users=()
+declare -a admin_users=()
+while IFS=: read -r account _ uid _ _ _ shell; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    ((uid >= 1000)) || continue
+    is_human_account "$account" || continue
 
-if [[ -z "$username" ]]; then
-    printf 'Password update skipped.\n'
+    if is_admin_account "$account"; then
+        admin_users+=("$account")
+    else
+        target_users+=("$account")
+    fi
+done < <(getent passwd)
+
+printf '\nAdministrator accounts excluded:\n'
+printf '  root\n'
+if ((${#admin_users[@]} > 0)); then
+    printf '  %s\n' "${admin_users[@]}"
+fi
+
+if ((${#target_users[@]} == 0)); then
+    printf '\nNo eligible non-administrator human accounts were found.\n'
     exit 0
 fi
 
-is_human_account "$username" || fail "'$username' is not a verified human login account."
+printf '\nAccounts that will receive the competition password:\n'
+printf '  %s\n' "${target_users[@]}"
+printf '\nType APPLY to set the password for these accounts, or anything else to cancel: '
+IFS= read -r confirmation || true
 
-printf 'Starting interactive password change for %s. Type 1P@ssword! when prompted if that is the competition password.\n' "$username"
-passwd "$username"
+if [[ "$confirmation" != 'APPLY' ]]; then
+    printf 'Password updates cancelled.\n'
+    exit 0
+fi
+
+default_password='1P@ssword!'
+failures=0
+for account in "${target_users[@]}"; do
+    if printf '%s:%s\n' "$account" "$default_password" | chpasswd; then
+        printf 'Password updated for %s.\n' "$account"
+    else
+        printf 'Unable to update password for %s.\n' "$account" >&2
+        failures=$((failures + 1))
+    fi
+done
+unset default_password
+
+if ((failures > 0)); then
+    fail "$failures password update(s) failed."
+fi
+
+printf '\nPassword updates completed for all eligible non-administrator accounts.\n'
