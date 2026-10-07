@@ -148,12 +148,53 @@ password_state() {
     esac
 }
 
+pwquality_value() {
+    local key="$1"
+    awk -F= -v key="$key" '
+        /^[[:space:]]*#/ { next }
+        {
+            name=$1
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+            if (name == key) {
+                value=$2
+                sub(/[[:space:]]+#.*/, "", value)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                if (found && configured != value) {
+                    conflict=1
+                }
+                configured=value
+                found=1
+            }
+        }
+        END {
+            if (conflict) print "__conflicting_values__"
+            else if (found) print configured
+        }
+    ' /etc/security/pwquality.conf 2>/dev/null
+}
+
+login_max_password_days() {
+    awk -v max="$DEFAULT_MAX_PASSWORD_DAYS" '
+        $1 == "PASS_MAX_DAYS" {
+            count++
+            if ($2 !~ /^[0-9]+$/ || $2 > max) invalid=1
+            value=$2
+        }
+        END {
+            if (count && !invalid) print value
+        }
+    ' /etc/login.defs 2>/dev/null
+}
+
 backup_file() {
     local file="$1" stamp destination
     [[ -f "$file" ]] || return 0
     stamp="$(date +%Y%m%d%H%M%S)"
-    destination="${file}.noje-backup-${stamp}"
-    cp -p -- "$file" "$destination" || return 1
+    destination="$(mktemp "${file}.noje-backup-${stamp}.XXXXXX")" || return 1
+    if ! cp -p -- "$file" "$destination"; then
+        rm -f -- "$destination"
+        return 1
+    fi
     info_msg "Backup created: $destination"
 }
 
@@ -286,7 +327,13 @@ account_reconcile() {
     local uid0
     uid0="$(awk -F: '$3 == 0 {print $1}' /etc/passwd 2>/dev/null | paste -sd ' ' -)"
     printf 'UID 0 accounts: %s\n' "${uid0:-none found}"
-    [[ "$uid0" == root ]] && pass_msg 'Only root owns UID 0.' || warn_msg 'More than one UID 0 account exists.'
+    if [[ "$uid0" == root ]]; then
+        pass_msg 'Only root owns UID 0.'
+    elif [[ -z "$uid0" ]]; then
+        warn_msg 'No UID 0 account was found.'
+    else
+        warn_msg "Unexpected UID 0 account set: $uid0"
+    fi
 }
 
 account_details() {
@@ -339,13 +386,28 @@ account_home_permissions() {
         mode="$(stat -c '%a' -- "$home" 2>/dev/null || printf unknown)"
         if [[ "$owner" != "$user" ]]; then warn_msg "$home owner is $owner; expected $user."; else pass_msg "$home owner is $user."; fi
         printf '  %-24s mode=%s\n' "$home" "$mode"
-        [[ "$mode" =~ ^[0-7]+$ ]] && (( 10#$mode % 10 <= 7 )) || true
+        if [[ "$mode" =~ ^[0-7]+$ ]]; then
+            if (( ((10#$mode / 10) % 10 & 2) || (10#$mode % 10 & 2) )); then
+                warn_msg "$home is writable by group or other users (mode $mode)."
+            else
+                pass_msg "$home is not group/other writable."
+            fi
+        else
+            warn_msg "Could not determine permissions for $home."
+        fi
         path="$home/.ssh"
         if [[ -e "$path" ]]; then
             owner="$(stat -c '%U' -- "$path" 2>/dev/null || printf unknown)"
             mode="$(stat -c '%a' -- "$path" 2>/dev/null || printf unknown)"
             if [[ "$owner" != "$user" ]]; then warn_msg "$path owner=$owner expected=$user"; fi
             printf '  %-24s mode=%s owner=%s\n' "$path" "$mode" "$owner"
+            if [[ -d "$path" && "$mode" =~ ^[0-7]+$ ]]; then
+                if (( 10#$mode % 100 != 0 )); then
+                    warn_msg "$path grants group/other permissions (mode $mode); restrict it, commonly to 700."
+                else
+                    pass_msg "$path has no group/other permissions."
+                fi
+            fi
             for path in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
                 [[ -e "$path" ]] || continue
                 owner="$(stat -c '%U' -- "$path" 2>/dev/null || printf unknown)"
@@ -453,6 +515,17 @@ password_policy_audit() {
     subsection 'pwquality.conf'
     if [[ -f /etc/security/pwquality.conf ]]; then
         grep -E '^[[:space:]]*(minlen|dcredit|ucredit|lcredit|ocredit|maxrepeat|maxsequence|difok)[[:space:]]*=' /etc/security/pwquality.conf 2>/dev/null || info_msg 'No selected pwquality settings found.'
+        local key expected actual
+        for key in minlen dcredit ocredit; do
+            case "$key" in
+                minlen) expected=10 ;;
+                *) expected=-1 ;;
+            esac
+            actual="$(pwquality_value "$key")"
+            [[ "$actual" == "$expected" ]] && pass_msg "pwquality $key=$actual is configured." || warn_msg "pwquality $key should be $expected (currently ${actual:-unset})."
+        done
+    else
+        warn_msg 'Cannot verify required pwquality settings because pwquality.conf is missing.'
     fi
     subsection 'PAM pwquality enforcement'
     if grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' /etc/pam.d/common-password 2>/dev/null; then
@@ -464,61 +537,104 @@ password_policy_audit() {
     subsection 'login.defs'
     grep -E '^[[:space:]]*(PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_WARN_AGE)[[:space:]]+' /etc/login.defs 2>/dev/null || true
     local max
-    max="$(awk '$1 == "PASS_MAX_DAYS" {print $2; exit}' /etc/login.defs 2>/dev/null)"
+    max="$(login_max_password_days)"
     if [[ "$max" =~ ^[0-9]+$ ]] && (( max <= DEFAULT_MAX_PASSWORD_DAYS )); then
         pass_msg "PASS_MAX_DAYS=$max meets the NOJE $DEFAULT_MAX_PASSWORD_DAYS-day baseline."
     else
         warn_msg "PASS_MAX_DAYS is missing or greater than the NOJE $DEFAULT_MAX_PASSWORD_DAYS-day baseline."
+    fi
+    subsection 'Existing human-account password age'
+    if (( EUID != 0 )); then
+        info_msg 'Run as root to verify each account password age.'
+    else
+        local user shadow_record max_age last_change
+        while IFS=$'\t' read -r user _ _ _ _; do
+            shadow_record="$(getent shadow "$user" 2>/dev/null)"
+            max_age="$(awk -F: 'NR == 1 {print $5}' <<< "$shadow_record")"
+            last_change="$(awk -F: 'NR == 1 {print $3}' <<< "$shadow_record")"
+            if [[ "$max_age" =~ ^[0-9]+$ ]] && (( max_age <= DEFAULT_MAX_PASSWORD_DAYS )); then
+                pass_msg "$user maximum password age is $max_age days."
+            else
+                warn_msg "$user maximum password age is ${max_age:-unknown}; expected at most $DEFAULT_MAX_PASSWORD_DAYS days."
+            fi
+            if [[ "$last_change" == 0 ]]; then
+                review_msg "$user must change their password at next login."
+            fi
+        done < <(list_human_accounts)
     fi
 }
 
 password_policy_apply() {
     need_root || return 1
     local answer
-    printf 'This will modify pwquality.conf, common-password and login.defs. Backups will be created. Continue? [y/N]: '
+    printf 'This will apply system-wide password quality rules, set defaults for new accounts, set a %s-day maximum age, and force existing human login accounts to change passwords at next login. Backups will be created. Continue? [y/N]: ' "$DEFAULT_MAX_PASSWORD_DAYS"
     tty_read -r answer || true
     case "$answer" in y|Y|yes|YES) ;; *) info_msg 'No password-policy changes made.'; return 0 ;; esac
-    local changed_pw=0 changed_pam=0 changed_defs=0
+    local changed_pam=0 failed_ages=0 user
     [[ -f /etc/security/pwquality.conf ]] || { warn_msg 'pwquality.conf missing; no changes made.'; return 1; }
     [[ -f /etc/pam.d/common-password ]] || { warn_msg 'common-password missing; no changes made.'; return 1; }
     [[ -f /etc/login.defs ]] || { warn_msg 'login.defs missing; no changes made.'; return 1; }
+    have chage || { warn_msg 'chage is unavailable; no password-policy changes made.'; return 1; }
+    if ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' /etc/pam.d/common-password &&
+        ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_unix\.so' /etc/pam.d/common-password; then
+        warn_msg 'Could not find a pam_unix password line; no password-policy changes made.'
+        return 1
+    fi
+    if ! find /lib /usr/lib -type f -name pam_pwquality.so -print -quit 2>/dev/null | grep -q .; then
+        warn_msg 'pam_pwquality.so is unavailable; install libpam-pwquality before applying this policy.'
+        return 1
+    fi
     backup_file /etc/security/pwquality.conf || return 1
     backup_file /etc/pam.d/common-password || return 1
     backup_file /etc/login.defs || return 1
 
-    set_pwq() {
-        local key="$1" value="$2"
+    local key value
+    for key in minlen dcredit ocredit; do
+        case "$key" in
+            minlen) value=10 ;;
+            *) value=-1 ;;
+        esac
         if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" /etc/security/pwquality.conf; then
-            sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" /etc/security/pwquality.conf
+            sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" /etc/security/pwquality.conf || return 1
         else
-            printf '%s = %s\n' "$key" "$value" >> /etc/security/pwquality.conf
+            printf '%s = %s\n' "$key" "$value" >> /etc/security/pwquality.conf || return 1
         fi
-    }
-    set_login_def() {
-        local key="$1" value="$2"
-        if grep -Eq "^[[:space:]]*${key}[[:space:]]+" /etc/login.defs; then
-            sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key}        ${value}|" /etc/login.defs
-        else
-            printf '%s        %s\n' "$key" "$value" >> /etc/login.defs
-        fi
-    }
-
-    set_pwq minlen 10
-    set_pwq dcredit -1
-    set_pwq ocredit -1
-    set_login_def PASS_MAX_DAYS "$DEFAULT_MAX_PASSWORD_DAYS"
-    changed_pw=1; changed_defs=1
+    done
+    if grep -Eq '^[[:space:]]*PASS_MAX_DAYS[[:space:]]+' /etc/login.defs; then
+        sed -i -E "s|^[[:space:]]*PASS_MAX_DAYS[[:space:]]+.*|PASS_MAX_DAYS        ${DEFAULT_MAX_PASSWORD_DAYS}|" /etc/login.defs || return 1
+    else
+        printf 'PASS_MAX_DAYS        %s\n' "$DEFAULT_MAX_PASSWORD_DAYS" >> /etc/login.defs || return 1
+    fi
 
     if ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' /etc/pam.d/common-password; then
         if grep -Eq '^[[:space:]]*password[[:space:]].*pam_unix\.so' /etc/pam.d/common-password; then
-            sed -i '/^[[:space:]]*password[[:space:]].*pam_unix\.so/i password requisite pam_pwquality.so retry=3' /etc/pam.d/common-password
+            sed -i '/^[[:space:]]*password[[:space:]].*pam_unix\.so/i password requisite pam_pwquality.so retry=3' /etc/pam.d/common-password || return 1
             changed_pam=1
         else
-            warn_msg 'Could not find a pam_unix password line; PAM was not altered.'
+            warn_msg 'Could not find a pam_unix password line; PAM policy is not enforced.'
+            return 1
         fi
     fi
-    (( changed_pw || changed_pam || changed_defs )) && pass_msg 'Password-policy baseline written; verify below.'
+    pass_msg 'System-wide password quality rules and new-account password-age default written.'
+    (( changed_pam )) && pass_msg 'PAM password quality enforcement enabled for password changes.'
+
+    while IFS=$'\t' read -r user _ _ _ _; do
+        if chage -M "$DEFAULT_MAX_PASSWORD_DAYS" "$user"; then
+            pass_msg "Set maximum password age for existing account $user."
+        else
+            warn_msg "Could not set maximum password age for existing account $user."
+            failed_ages=$((failed_ages + 1))
+        fi
+        if chage -d 0 "$user"; then
+            pass_msg "$user must change their password at next login."
+        else
+            warn_msg "Could not require a password change for existing account $user."
+            failed_ages=$((failed_ages + 1))
+        fi
+    done < <(list_human_accounts)
+
     password_policy_audit
+    (( failed_ages == 0 )) || return 1
 }
 
 ###############################################################################
@@ -711,8 +827,11 @@ firewall_enable_prompt() {
     tty_read -r answer || true
     case "$answer" in
         y|Y|yes|YES)
-            ufw allow OpenSSH 2>/dev/null || true
-            ufw --force enable && pass_msg 'UFW enabled with an OpenSSH allow rule.' || warn_msg 'UFW enable failed.'
+            if ! ufw allow OpenSSH; then
+                warn_msg 'Could not add the OpenSSH allow rule; UFW was not enabled.'
+                return 1
+            fi
+            ufw --force enable && pass_msg 'UFW enabled with an OpenSSH allow rule.' || { warn_msg 'UFW enable failed.'; return 1; }
             ;;
         *) info_msg 'Firewall unchanged.' ;;
     esac
@@ -1184,11 +1303,11 @@ clamav_scan() {
 
 updates_audit() {
     section 'UBUNTU UPDATE AUDIT'
-    need_root || return 1
     if ! have apt-get; then warn_msg 'apt-get unavailable.'; return 1; fi
-    apt-get update -qq || warn_msg 'apt-get update encountered an error.'
-    local count
-    count="$(apt-get -s upgrade 2>/dev/null | awk '/^Inst /{n++} END{print n+0}')"
+    info_msg 'Read-only package simulation; package lists are not refreshed by this audit and may be stale.'
+    local simulation count
+    simulation="$(apt-get -s upgrade 2>&1)" || { warn_msg 'Package upgrade simulation failed.'; printf '%s\n' "$simulation"; return 1; }
+    count="$(printf '%s\n' "$simulation" | awk '/^Inst /{n++} END{print n+0}')"
     printf 'Upgradeable packages: %s\n' "$count"
     (( count == 0 )) && pass_msg 'No upgradeable packages reported by apt simulation.' || warn_msg "$count package(s) can be upgraded."
 }
@@ -1215,12 +1334,27 @@ updates_apply() {
 critical_file_permissions() {
     section 'CRITICAL FILE PERMISSION AUDIT'
     need_root || return 1
-    local file owner mode
+    local file owner group mode expected_owner expected_group expected_mode
     for file in /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers /etc/ssh/sshd_config; do
         [[ -e "$file" ]] || continue
         owner="$(stat -c '%U' -- "$file" 2>/dev/null || printf unknown)"
+        group="$(stat -c '%G' -- "$file" 2>/dev/null || printf unknown)"
         mode="$(stat -c '%a' -- "$file" 2>/dev/null || printf unknown)"
-        printf '%-24s owner=%-10s mode=%s\n' "$file" "$owner" "$mode"
+        expected_owner=root
+        expected_group=root
+        case "$file" in
+            /etc/shadow|/etc/gshadow) expected_group=shadow; expected_mode=640 ;;
+            /etc/passwd|/etc/group) expected_mode=644 ;;
+            /etc/sudoers) expected_mode=440 ;;
+            /etc/ssh/sshd_config) expected_mode=644 ;;
+        esac
+        printf '%-24s owner=%-10s group=%-10s mode=%s expected=%s:%s %s\n' \
+            "$file" "$owner" "$group" "$mode" "$expected_owner" "$expected_group" "$expected_mode"
+        if [[ "$owner" == "$expected_owner" && "$group" == "$expected_group" && "$mode" == "$expected_mode" ]]; then
+            pass_msg "$file ownership and mode match the Ubuntu baseline."
+        else
+            warn_msg "$file differs from the expected Ubuntu baseline; review before changing it."
+        fi
     done
     subsection 'World-writable critical files'
     find /etc -maxdepth 3 -type f -perm -0002 -print 2>/dev/null | sed 's/^/WARN: /'
@@ -1321,16 +1455,32 @@ integrated_accounts() {
 integrated_passwords() {
     section 'PASSWORD POLICY - AUDIT + ACTION'
     password_policy_audit
-    local need_fix=0 answer max
-    max="$(awk '$1 == "PASS_MAX_DAYS" {print $2; exit}' /etc/login.defs 2>/dev/null)"
+    local need_fix=0 age_unverified=0 answer max
+    max="$(login_max_password_days)"
     if ! [[ "$max" =~ ^[0-9]+$ ]] || (( max > DEFAULT_MAX_PASSWORD_DAYS )); then
         need_fix=1
     fi
     if ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' /etc/pam.d/common-password 2>/dev/null; then
         need_fix=1
     fi
-    if ! grep -Eq '^[[:space:]]*minlen[[:space:]]*=|^[[:space:]]*dcredit[[:space:]]*=|^[[:space:]]*ocredit[[:space:]]*=' /etc/security/pwquality.conf 2>/dev/null; then
-        need_fix=1
+    local key expected actual user max_age
+    for key in minlen dcredit ocredit; do
+        case "$key" in
+            minlen) expected=10 ;;
+            *) expected=-1 ;;
+        esac
+        actual="$(pwquality_value "$key")"
+        [[ "$actual" == "$expected" ]] || need_fix=1
+    done
+    if (( EUID == 0 )); then
+        while IFS=$'\t' read -r user _ _ _ _; do
+            max_age="$(getent shadow "$user" 2>/dev/null | awk -F: 'NR == 1 {print $5}')"
+            if ! [[ "$max_age" =~ ^[0-9]+$ ]] || (( max_age > DEFAULT_MAX_PASSWORD_DAYS )); then
+                need_fix=1
+            fi
+        done < <(list_human_accounts)
+    else
+        age_unverified=1
     fi
     if (( need_fix )); then
         printf '\nPassword-policy findings were detected. Apply the NOJE baseline now? [y/N]: '
@@ -1340,7 +1490,11 @@ integrated_passwords() {
             *) info_msg 'Password policy unchanged.' ;;
         esac
     else
-        pass_msg 'Password-policy baseline appears to be present; no action needed.'
+        if (( age_unverified )); then
+            info_msg 'Password quality and new-account defaults appear configured; run as root to verify current-account ages.'
+        else
+            pass_msg 'Password-policy baseline appears to be present; no action needed.'
+        fi
     fi
 }
 
@@ -1478,9 +1632,10 @@ integrated_files_malware() {
 
 integrated_updates() {
     section 'UBUNTU UPDATES - AUDIT + ACTION'
-    updates_audit
-    local count answer
-    count="$(apt-get -s upgrade 2>/dev/null | awk '/^Inst /{n++} END{print n+0}')"
+    updates_audit || return 1
+    local count answer simulation
+    simulation="$(apt-get -s upgrade 2>&1)" || { warn_msg 'Package upgrade simulation failed; no update action was offered.'; printf '%s\n' "$simulation"; return 1; }
+    count="$(printf '%s\n' "$simulation" | awk '/^Inst /{n++} END{print n+0}')"
     if [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )); then
         printf '\n%d package(s) can be upgraded. Apply updates now? [y/N]: ' "$count"
         tty_read -r answer || true
