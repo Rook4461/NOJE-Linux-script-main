@@ -1,1 +1,837 @@
+#!/usr/bin/env bash
+# NOJE Linux security toolkit - single-file edition.
+# Based on the project modules; all functions and menus are contained here.
+# Review actions before confirming them. This script is intended for Ubuntu 24.04.
+
+set -u
+
+noje_pause() {
+	printf '\nPress Enter to continue...'
+	IFS= read -r _ || true
+}
+
+noje_require_root() {
+	if ((EUID != 0)); then
+		printf 'This action requires root. Run the script with sudo.\n' >&2
+		return 1
+	fi
+}
+
+###############################################################################
+# User audit and account management
+###############################################################################
+
+USER_AUTHORIZED_ADMIN_USERS=(link zelda impa urbosa darunia)
+USER_AUTHORIZED_USERS=(tingle beedle groose malon ruto sidon midna rauru teba mipha paya skullkid anju dampe kingrhoam saria epona linebeck purah tatl)
+
+user_is_authorized() {
+	local target="$1" user
+	[[ "$target" == root ]] && return 0
+	for user in "${USER_AUTHORIZED_ADMIN_USERS[@]}" "${USER_AUTHORIZED_USERS[@]}"; do
+		[[ "$target" == "$user" ]] && return 0
+	done
+	return 1
+}
+
+user_is_authorized_admin() {
+	local target="$1" user
+	for user in "${USER_AUTHORIZED_ADMIN_USERS[@]}"; do
+		[[ "$target" == "$user" ]] && return 0
+	done
+	return 1
+}
+
+user_passwd_entries() {
+	getent passwd 2>/dev/null || cat /etc/passwd 2>/dev/null || true
+}
+
+user_passwd_entry() {
+	local target="$1"
+	getent passwd "$target" 2>/dev/null || awk -F: -v target="$target" '$1 == target { print }' /etc/passwd 2>/dev/null || true
+}
+
+user_type() {
+	local user="$1" entry uid home shell
+	entry="$(user_passwd_entry "$user")"
+	[[ -n "$entry" ]] || { printf 'missing'; return; }
+	IFS=: read -r _ _ uid _ _ home shell <<< "$entry"
+	if [[ "$uid" == 0 ]]; then
+		printf 'root'
+	elif [[ "$shell" == *nologin* || "$shell" == *false* || "$shell" == *sync* || "$shell" == *halt* || "$shell" == *shutdown* ]] || ((uid < 1000)); then
+		printf 'system'
+	elif ((uid >= 1000)) && [[ -n "$home" ]]; then
+		printf 'human'
+	else
+		printf 'system'
+	fi
+}
+
+user_is_admin() {
+	local user="$1" groups
+	[[ "$(id -u "$user" 2>/dev/null || printf 'unknown')" == 0 ]] && return 0
+	groups="$(id -nG "$user" 2>/dev/null || true)"
+	printf '%s\n' "$groups" | tr ' ' '\n' | grep -Eq '^(sudo|wheel|adm|admin)$'
+}
+
+user_password_state() {
+	local status
+	status="$(passwd -S "$1" 2>/dev/null || true)"
+	case "${status#* }" in
+		P*) printf 'set' ;;
+		NP*) printf 'no-password' ;;
+		L*|LK*) printf 'locked' ;;
+		*) printf 'unknown' ;;
+	esac
+}
+
+user_account_status() {
+	local shell
+	shell="$(user_passwd_entry "$1" | cut -d: -f7)"
+	if [[ -z "$shell" ]]; then printf 'missing'
+	elif [[ "$shell" == *nologin* || "$shell" == *false* || "$shell" == *sync* ]]; then printf 'disabled'
+	else printf 'active'
+	fi
+}
+
+user_print_list() {
+	local user uid home shell type groups admin password status
+	printf '\n=== Human and Administrative Accounts ===\n'
+	printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' USER UID TYPE GROUPS ADMIN PASSWORD STATUS
+	while IFS=: read -r user _ uid _ _ home shell; do
+		type="$(user_type "$user")"
+		[[ "$type" == human ]] || continue
+		groups="$(id -nG "$user" 2>/dev/null || printf 'unknown')"
+		if user_is_admin "$user"; then admin=YES; else admin=NO; fi
+		password="$(user_password_state "$user")"
+		status="$(user_account_status "$user")"
+		printf '%-18s %-8s %-8s %-24s %-8s %-12s %-12s\n' "$user" "$uid" "$type" "${groups// /,}" "$admin" "$password" "$status"
+	done < <(user_passwd_entries)
+}
+
+user_show_details() {
+	local user="$1" entry home
+	printf '\n=== Details for %s ===\n' "$user"
+	id "$user" 2>/dev/null || { printf 'Account not found.\n'; return 1; }
+	printf 'Groups: %s\n' "$(id -nG "$user" 2>/dev/null || printf unknown)"
+	printf 'Password state: %s\n' "$(user_password_state "$user")"
+	printf 'Account status: %s\n' "$(user_account_status "$user")"
+	if command -v chage >/dev/null 2>&1; then chage -l "$user" 2>/dev/null || true; fi
+	entry="$(user_passwd_entry "$user")"
+	home="$(cut -d: -f6 <<< "$entry")"
+	[[ -n "$home" ]] && ls -ld -- "$home" 2>/dev/null || true
+}
+
+user_delete() {
+	local user="$1" confirm
+	if user_is_authorized "$user"; then
+		printf 'Refusing to delete protected account %s.\n' "$user"
+		return 1
+	fi
+	[[ "$(user_type "$user")" == human ]] || { printf 'Only human login accounts can be deleted from this menu.\n'; return 1; }
+	printf 'This permanently deletes %s and requests removal of its home directory.\nType the username to confirm: ' "$user"
+	IFS= read -r confirm || true
+	[[ "$confirm" == "$user" ]] || { printf 'Deletion cancelled.\n'; return 0; }
+	if userdel -r "$user"; then printf 'Deleted account %s.\n' "$user"; else printf 'Deletion failed for %s.\n' "$user" >&2; return 1; fi
+}
+
+user_remove_admin() {
+	local user="$1" group changed=0
+	if user_is_authorized_admin "$user"; then
+		printf 'Refusing to remove administrator access from authorized administrator %s.\n' "$user"
+		return 1
+	fi
+	[[ "$(user_type "$user")" == human ]] || { printf 'Only human login accounts can be changed from this menu.\n'; return 1; }
+	for group in sudo wheel adm admin; do
+		if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$group"; then
+			if gpasswd -d "$user" "$group"; then changed=1; else printf 'Could not remove %s from %s.\n' "$user" "$group" >&2; fi
+		fi
+	done
+	((changed)) && printf 'Updated groups for %s: %s\n' "$user" "$(id -nG "$user" 2>/dev/null)" || printf 'No administrator groups found for %s.\n' "$user"
+}
+
+user_remove_group() {
+	local user="$1" group
+	[[ "$(user_type "$user")" == human ]] || { printf 'Only human login accounts can be changed from this menu.\n'; return 1; }
+	read -r -p "Group to remove from $user: " group
+	[[ -n "$group" ]] || { printf 'No group entered.\n'; return 1; }
+	if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$group"; then
+		gpasswd -d "$user" "$group" || return 1
+		printf 'Removed %s from %s.\n' "$user" "$group"
+	else
+		printf '%s is not in group %s.\n' "$user" "$group"
+	fi
+}
+
+user_change_password() {
+	local user="$1"
+	[[ "$(user_type "$user")" == human ]] || { printf 'Only human login accounts can be changed from this menu.\n'; return 1; }
+	printf 'Set a unique password for %s. Password input is handled by passwd and is not logged by this script.\n' "$user"
+	passwd "$user"
+}
+
+user_manage() {
+	local user="$1" choice
+	[[ "$(user_type "$user")" == human ]] || { printf 'Only human login accounts can be managed from this menu.\n'; return 1; }
+	while true; do
+		printf '\n=== Manage user: %s ===\n1) Delete user\n2) Remove admin rights\n3) Show groups\n4) Change password\n5) Remove from a group\n6) Show account details\n0) Back\n' "$user"
+		read -r -p 'Select: ' choice || return
+		case "$choice" in
+			1) user_delete "$user" ;;
+			2) user_remove_admin "$user" ;;
+			3) groups "$user" ;;
+			4) user_change_password "$user" ;;
+			5) user_remove_group "$user" ;;
+			6) user_show_details "$user" ;;
+			0) return ;;
+			*) printf 'Invalid selection.\n' ;;
+		esac
+		noje_pause
+	done
+}
+
+run_user_audit() {
+	local target
+	printf '\n*** Account deletion and access changes are real system actions. ***\n'
+	if ((EUID != 0)); then printf 'Read-only listing is available; account changes require sudo/root.\n'; fi
+	while true; do
+		user_print_list
+		printf '\nEnter a listed human username, Enter to refresh, or q to exit.\n'
+		read -r -p 'User: ' target || return
+		case "$target" in q|Q) return ;; '') continue ;; esac
+		if [[ "$(user_type "$target")" != human ]]; then printf 'Unknown or protected non-human account.\n'; continue; fi
+		user_manage "$target"
+	done
+}
+
+###############################################################################
+# Password policy
+###############################################################################
+
+PASSWORD_PWQUALITY_FILE='/etc/security/pwquality.conf'
+PASSWORD_PAM_FILE='/etc/pam.d/common-password'
+PASSWORD_LOGIN_DEFS_FILE='/etc/login.defs'
+
+password_fail() { printf 'Error: %s\n' "$1" >&2; return 1; }
+
+password_backup_file() {
+	local file="$1" stamp
+	stamp="$(date +%Y%m%d%H%M%S)"
+	cp -p -- "$file" "${file}.noje-backup-${stamp}" || return 1
+	printf 'Backup: %s\n' "${file}.noje-backup-${stamp}"
+}
+
+password_set_pwquality() {
+	local key="$1" value="$2"
+	if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "$PASSWORD_PWQUALITY_FILE"; then
+		sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "$PASSWORD_PWQUALITY_FILE"
+	else
+		printf '%s = %s\n' "$key" "$value" >> "$PASSWORD_PWQUALITY_FILE"
+	fi
+}
+
+password_set_login_defs() {
+	local key="$1" value="$2"
+	if grep -Eq "^[[:space:]]*${key}[[:space:]]+" "$PASSWORD_LOGIN_DEFS_FILE"; then
+		sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key}        ${value}|" "$PASSWORD_LOGIN_DEFS_FILE"
+	else
+		printf '%s        %s\n' "$key" "$value" >> "$PASSWORD_LOGIN_DEFS_FILE"
+	fi
+}
+
+password_is_human() {
+	local record uid shell
+	record="$(getent passwd "$1" 2>/dev/null)" || return 1
+	IFS=: read -r _ _ uid _ _ _ shell <<< "$record"
+	[[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1000)) && [[ "$shell" != */nologin && "$shell" != */false ]]
+}
+
+password_is_admin() {
+	local groups group
+	[[ "$1" == root ]] && return 0
+	groups="$(id -nG "$1" 2>/dev/null)" || return 1
+	for group in $groups; do case "$group" in sudo|admin|wheel) return 0 ;; esac; done
+	return 1
+}
+
+password_collect_humans() {
+	local account _ uid rest shell
+	PASSWORD_HUMAN_USERS=()
+	while IFS=: read -r account _ uid _ _ _ shell; do
+		[[ "$uid" =~ ^[0-9]+$ ]] || continue
+		((uid >= 1000)) || continue
+		password_is_human "$account" && PASSWORD_HUMAN_USERS+=("$account")
+	done < <(getent passwd)
+}
+
+password_apply_policy() {
+	local account _ uid _ _ _ shell state count=0
+	noje_require_root || return 1
+	[[ -r /etc/os-release ]] && grep -Eq '^(ID|ID_LIKE)=(ubuntu|debian|.*debian.*)' /etc/os-release || { password_fail 'Ubuntu/Debian only.'; return 1; }
+	[[ -f "$PASSWORD_PWQUALITY_FILE" && -f "$PASSWORD_PAM_FILE" && -f "$PASSWORD_LOGIN_DEFS_FILE" ]] || { password_fail 'Required password-policy files are missing. Install libpam-pwquality if needed.'; return 1; }
+	find /lib /usr/lib -name pam_pwquality.so -print -quit 2>/dev/null | grep -q . || { password_fail 'pam_pwquality is unavailable; no changes made.'; return 1; }
+	password_backup_file "$PASSWORD_PWQUALITY_FILE" || return 1
+	password_backup_file "$PASSWORD_PAM_FILE" || return 1
+	password_backup_file "$PASSWORD_LOGIN_DEFS_FILE" || return 1
+	password_set_pwquality minlen 10
+	password_set_pwquality dcredit -1
+	password_set_pwquality ocredit -1
+	password_set_login_defs PASS_MAX_DAYS 90
+	if ! grep -Eq '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' "$PASSWORD_PAM_FILE"; then
+		grep -Eq '^[[:space:]]*password[[:space:]].*pam_unix\.so' "$PASSWORD_PAM_FILE" || { password_fail 'Could not locate a pam_unix PAM rule; inspect the backup and make no further changes.'; return 1; }
+		sed -i '/^[[:space:]]*password[[:space:]].*pam_unix\.so/i password requisite pam_pwquality.so retry=3' "$PASSWORD_PAM_FILE"
+	fi
+	password_collect_humans
+	printf 'Policy configured for %d human account(s): min length 10, at least one digit and special character, max age 90 days.\n' "${#PASSWORD_HUMAN_USERS[@]}"
+	printf 'Human accounts with missing/locked passwords:\n'
+	while IFS=: read -r account _ uid _ _ _ shell; do
+		[[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1000)) && password_is_human "$account" || continue
+		state="$(passwd -S "$account" 2>/dev/null | awk '{ print $2 }')"
+		if [[ "$state" == NP || "$state" == L || "$state" == LK || -z "$state" ]]; then printf '  %s (%s)\n' "$account" "${state:-unknown}"; count=$((count + 1)); fi
+	done < <(getent passwd)
+	((count)) || printf '  None found.\n'
+}
+
+password_change_selected() {
+	local account answer role
+	for account in "$@"; do
+		password_is_human "$account" || continue
+		role=''
+		password_is_admin "$account" && role=' (administrator)'
+		printf '\nChange password for %s%s? [y/N]: ' "$account" "$role"
+		IFS= read -r answer || true
+		case "$answer" in
+			y|Y|yes|YES)
+				printf 'Set a unique password for %s. It will not be stored by this script.\n' "$account"
+				passwd "$account" || printf 'Password change failed for %s.\n' "$account" >&2
+				;;
+			*) printf 'Skipped %s.\n' "$account" ;;
+		esac
+	done
+}
+
+password_list_humans() {
+	local account choice
+	password_collect_humans
+	if ((${#PASSWORD_HUMAN_USERS[@]} == 0)); then printf 'No eligible human accounts found.\n'; return; fi
+	for account in "${PASSWORD_HUMAN_USERS[@]}"; do
+		printf '\nChange password for %s? [y/N]: ' "$account"
+		IFS= read -r choice || true
+		case "$choice" in y|Y|yes|YES) passwd "$account" || printf 'Password change failed for %s.\n' "$account" >&2 ;; *) printf 'Skipped %s.\n' "$account" ;; esac
+	done
+}
+
+password_list_admins() {
+	local account _ uid _ _ _ shell
+	local -a admins=()
+	while IFS=: read -r account _ uid _ _ _ shell; do
+		[[ "$account" == root ]] && continue
+		[[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1000)) && password_is_human "$account" && password_is_admin "$account" && admins+=("$account")
+	done < <(getent passwd)
+	if ((${#admins[@]} == 0)); then printf 'No eligible human administrator accounts found.\n'; else password_change_selected "${admins[@]}"; fi
+}
+
+run_password_policy() {
+	local choice
+	noje_require_root || return 1
+	while true; do
+		printf '\n=== Password Policy ===\n1) Apply general password policy\n2) Change human account passwords\n3) Change administrator passwords\n0) Back\n'
+		read -r -p 'Select: ' choice || return
+		case "$choice" in
+			1) password_apply_policy ;;
+			2) password_list_humans ;;
+			3) password_list_admins ;;
+			0|q|Q) return ;;
+			*) printf 'Invalid selection.\n' ;;
+		esac
+		noje_pause
+	done
+}
+
+###############################################################################
+# System and SSH review
+###############################################################################
+
+ssh_service_name() {
+	if systemctl list-unit-files --no-legend ssh.service 2>/dev/null | grep -q '^ssh\.service'; then printf 'ssh'
+	elif systemctl list-unit-files --no-legend sshd.service 2>/dev/null | grep -q '^sshd\.service'; then printf 'sshd'
+	else printf ''; fi
+}
+
+ssh_check_service() {
+	local service
+	service="$(ssh_service_name)"
+	[[ -n "$service" ]] || { printf 'OpenSSH server service was not found.\n'; return; }
+	if systemctl is-active --quiet "$service"; then printf 'PASS: SSH service %s is active.\n' "$service"; else printf 'WARN: SSH service %s is not active.\n' "$service"; fi
+	if systemctl is-enabled --quiet "$service"; then printf 'PASS: SSH service %s is enabled.\n' "$service"; else printf 'WARN: SSH service %s is not enabled.\n' "$service"; fi
+}
+
+ssh_audit_key_permissions() {
+	local key path owner mode account
+	local -a keys=()
+	printf '\n--- SSH host private keys ---\n'
+	for key in /etc/ssh/ssh_host_*_key; do [[ -f "$key" ]] && keys+=("$key"); done
+	if ((${#keys[@]} == 0)); then printf 'WARN: no host private keys found.\n'; fi
+	for key in "${keys[@]}"; do
+		owner="$(stat -c '%U' -- "$key" 2>/dev/null || printf unknown)"
+		mode="$(stat -c '%a' -- "$key" 2>/dev/null || printf unknown)"
+		if [[ "$owner" == root ]] && ! find "$key" -maxdepth 0 -perm /077 -print -quit 2>/dev/null | grep -q .; then printf 'PASS: %s root-owned, mode %s.\n' "$key" "$mode"; else printf 'WARN: review %s owner=%s mode=%s.\n' "$key" "$owner" "$mode"; fi
+	done
+	printf '\n--- User SSH directories and authorized keys ---\n'
+	for path in /home/*; do
+		[[ -d "$path" ]] || continue
+		account="${path##*/}"
+		for key in "$path/.ssh" "$path/.ssh/authorized_keys" "$path/.ssh/authorized_keys2"; do
+			[[ -e "$key" ]] || continue
+			owner="$(stat -c '%U' -- "$key" 2>/dev/null || printf unknown)"
+			mode="$(stat -c '%a' -- "$key" 2>/dev/null || printf unknown)"
+			if [[ "$owner" != "$account" ]] || find "$key" -maxdepth 0 -perm /077 -print -quit 2>/dev/null | grep -q .; then printf 'WARN: review %s owner=%s mode=%s.\n' "$key" "$owner" "$mode"; else printf 'PASS: %s owner=%s mode=%s.\n' "$key" "$owner" "$mode"; fi
+		done
+	done
+}
+
+ssh_audit_security() {
+	local effective root_login empty_passwords password_auth pubkey_auth max_auth_tries ciphers macs kex root_state
+	command -v sshd >/dev/null 2>&1 || { printf 'OpenSSH server is not installed.\n'; return 1; }
+	effective="$(sshd -T 2>/dev/null)" || { printf 'Could not read effective SSH settings; run as root and check configuration syntax.\n' >&2; return 1; }
+	root_login="$(awk '$1 == "permitrootlogin" { print $2; exit }' <<< "$effective")"
+	empty_passwords="$(awk '$1 == "permitemptypasswords" { print $2; exit }' <<< "$effective")"
+	password_auth="$(awk '$1 == "passwordauthentication" { print $2; exit }' <<< "$effective")"
+	pubkey_auth="$(awk '$1 == "pubkeyauthentication" { print $2; exit }' <<< "$effective")"
+	max_auth_tries="$(awk '$1 == "maxauthtries" { print $2; exit }' <<< "$effective")"
+	ciphers="$(awk '$1 == "ciphers" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$effective")"
+	macs="$(awk '$1 == "macs" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$effective")"
+	kex="$(awk '$1 == "kexalgorithms" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$effective")"
+	root_state="$(passwd -S root 2>/dev/null | awk '{ print $2 }')"
+	printf '\n=== Effective SSH settings ===\nPermitRootLogin: %s\nPermitEmptyPasswords: %s\nRoot password state: %s\nPasswordAuthentication: %s (unchanged)\nPubkeyAuthentication: %s\nMaxAuthTries: %s\n' "${root_login:-unknown}" "${empty_passwords:-unknown}" "${root_state:-unknown}" "${password_auth:-unknown}" "${pubkey_auth:-unknown}" "${max_auth_tries:-unknown}"
+	[[ "$root_login" == no ]] && printf 'PASS: root SSH login disabled.\n' || printf 'WARN: root SSH login not fully disabled.\n'
+	[[ "$empty_passwords" == no ]] && printf 'PASS: empty-password SSH login disabled.\n' || printf 'WARN: empty-password SSH login setting needs review.\n'
+	[[ "$root_state" == L || "$root_state" == LK ]] && printf 'PASS: root password locked.\n' || printf 'WARN: root password not confirmed locked.\n'
+	[[ "$pubkey_auth" == yes ]] && printf 'PASS: public-key authentication enabled.\n' || printf 'WARN: public-key authentication is not enabled.\n'
+	if [[ "$max_auth_tries" =~ ^[0-9]+$ ]] && ((max_auth_tries <= 4)); then printf 'PASS: MaxAuthTries <= 4.\n'; else printf 'WARN: consider MaxAuthTries 4 or lower.\n'; fi
+	printf '\nCiphers: %s\n' "${ciphers:-unknown}"
+	if grep -Eiq '(^|,)(3des-cbc|aes(128|192|256)-cbc)(,|$)' <<< "$ciphers"; then printf 'WARN: CBC/3DES cipher enabled.\n'; else printf 'PASS: no reviewed CBC/3DES cipher enabled.\n'; fi
+	printf 'MACs: %s\n' "${macs:-unknown}"
+	if grep -Eiq '(^|,)(hmac-md5(-96)?(-etm@openssh\.com)?|hmac-sha1(-96)?(-etm@openssh\.com)?|umac-64(@openssh\.com|-etm@openssh\.com)?)(,|$)' <<< "$macs"; then printf 'WARN: legacy MAC enabled.\n'; else printf 'PASS: no reviewed legacy MAC enabled.\n'; fi
+	printf 'Key exchanges: %s\n' "${kex:-unknown}"
+	if grep -Eiq 'diffie-hellman-(group1-sha1|group14-sha1|group-exchange-sha1)' <<< "$kex"; then printf 'WARN: legacy/SHA-1 key exchange enabled.\n'; else printf 'PASS: no reviewed SHA-1 key exchange enabled.\n'; fi
+	printf 'Ubuntu 24.04 OpenSSH supports protocol 2 only; no Protocol directive is needed.\n'
+	ssh_audit_key_permissions
+}
+
+ssh_check_platform() {
+	local id=unknown version=unknown
+	if [[ -r /etc/os-release ]]; then . /etc/os-release; id="${ID:-unknown}"; version="${VERSION_ID:-unknown}"; fi
+	printf 'Platform: %s %s\n' "$id" "$version"
+	[[ "$id" == ubuntu && "$version" == 24.04 ]] && printf 'PASS: Ubuntu 24.04.\n' || printf 'WARN: expected Ubuntu 24.04.\n'
+}
+
+ssh_check_login_manager() {
+	local manager=unknown
+	[[ -L /etc/systemd/system/display-manager.service ]] && manager="$(readlink -f /etc/systemd/system/display-manager.service)"
+	printf 'Display manager: %s\n' "$manager"
+	[[ "$manager" == */gdm3.service ]] && printf 'PASS: GDM3 active.\n' || printf 'WARN: GDM3 not confirmed.\n'
+}
+
+ssh_check_updates() {
+	local updates
+	command -v apt-get >/dev/null 2>&1 || { printf 'apt-get unavailable; updates not checked.\n'; return; }
+	updates="$(apt-get -s upgrade 2>/dev/null | awk '/^Inst / { count++ } END { print count + 0 }')"
+	printf 'Upgradeable packages: %s\n' "$updates"
+}
+
+ssh_check_scoreengine() {
+	local process service
+	process="$(pgrep -af scoreengine 2>/dev/null || true)"
+	service="$(systemctl is-active scoreengine.service 2>/dev/null || true)"
+	if [[ -n "$process" || "$service" == active ]]; then printf 'scoreengine detected and left untouched.\n'; else printf 'scoreengine not detected; nothing modified.\n'; fi
+}
+
+ssh_apply_baseline() {
+	local service config_dir config dropin backup temp effective root_login empty_passwords max_auth answer had_dropin=0
+	service="$(ssh_service_name)"
+	config='/etc/ssh/sshd_config'
+	config_dir='/etc/ssh/sshd_config.d'
+	dropin="$config_dir/00-noje-hardening.conf"
+	noje_require_root || return 1
+	[[ -n "$service" ]] || { printf 'SSH service not found.\n'; return 1; }
+	systemctl is-active --quiet "$service" || { printf 'SSH is not active; no changes made.\n'; return 1; }
+	[[ -f "$config" && -d "$config_dir" ]] || { printf 'Expected Ubuntu SSH config/include path not found.\n'; return 1; }
+	grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' "$config" || { printf 'SSH drop-in include missing; no changes made.\n'; return 1; }
+	printf 'This disables root and empty-password SSH login and limits attempts to 4. Other users password authentication stays unchanged. Continue? [y/N]: '
+	IFS= read -r answer || true
+	case "$answer" in y|Y|yes|YES) ;; *) printf 'No SSH changes made.\n'; return 0 ;; esac
+	if [[ -e "$dropin" ]]; then had_dropin=1; backup="${dropin}.noje-backup-$(date +%Y%m%d%H%M%S)"; cp -p "$dropin" "$backup" || return 1; fi
+	temp="$(mktemp "$config_dir/.noje-hardening.XXXXXX")" || return 1
+	if ! printf 'PermitRootLogin no\nPermitEmptyPasswords no\nMaxAuthTries 4\n' > "$temp" || ! chmod 0644 "$temp" || ! mv -f -- "$temp" "$dropin"; then rm -f -- "$temp"; return 1; fi
+	if ! sshd -t 2>/dev/null; then if ((had_dropin)); then cp -p "$backup" "$dropin"; else rm -f -- "$dropin"; fi; printf 'sshd syntax check failed; previous state restored.\n' >&2; return 1; fi
+	effective="$(sshd -T 2>/dev/null)" || effective=''
+	root_login="$(awk '$1 == "permitrootlogin" { print $2; exit }' <<< "$effective")"
+	empty_passwords="$(awk '$1 == "permitemptypasswords" { print $2; exit }' <<< "$effective")"
+	max_auth="$(awk '$1 == "maxauthtries" { print $2; exit }' <<< "$effective")"
+	if [[ "$root_login" != no || "$empty_passwords" != no || "$max_auth" != 4 ]]; then if ((had_dropin)); then cp -p "$backup" "$dropin"; else rm -f -- "$dropin"; fi; printf 'Settings were overridden; previous state restored.\n' >&2; return 1; fi
+	if ! systemctl reload "$service"; then if ((had_dropin)); then cp -p "$backup" "$dropin"; else rm -f -- "$dropin"; fi; systemctl reload "$service" 2>/dev/null || true; return 1; fi
+	printf 'SSH baseline applied and service reloaded.\n'
+	((had_dropin)) && printf 'Backup: %s\n' "$backup"
+	return 0
+}
+
+ssh_ensure_enabled() {
+	local service
+	service="$(ssh_service_name)"
+	[[ -n "$service" ]] || { printf 'SSH service not found.\n'; return 1; }
+	noje_require_root || return 1
+	systemctl enable --now "$service" || return 1
+	printf 'SSH service %s is enabled and active.\n' "$service"
+}
+
+ssh_service_review_reason() {
+	local service="${1%.service}"
+	case "$service" in
+		telnet*|rsh*|rexec*|tftp*|xinetd) printf 'legacy remote-access/inetd service' ;;
+		vsftpd|proftpd|pure-ftpd*|wu-ftpd*) printf 'FTP server' ;;
+		smbd|nmbd|samba) printf 'Samba file sharing' ;;
+		rpcbind|nfs-server|nfs-kernel-server|nfs-mountd|snmpd) printf 'network filesystem/management service' ;;
+		apache2|nginx|httpd|lighttpd) printf 'web server' ;;
+		postfix|exim4|sendmail|dovecot) printf 'mail service' ;;
+		*) return 1 ;;
+	esac
+}
+
+ssh_service_protected() {
+	local service="${1%.service}"
+	[[ "$service" == ssh || "$service" == sshd || "$service" == *scoreengine* ]]
+}
+
+ssh_audit_services() {
+	local output service reason answer
+	local -a services=()
+	noje_require_root || return 1
+	output="$(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null)" || { printf 'Could not list services.\n'; return 1; }
+	while IFS= read -r service; do [[ -n "$service" ]] && services+=("$service"); done < <(awk 'NF { print $1 }' <<< "$output")
+	printf '\n=== Running Services ===\n'
+	((${#services[@]})) || { printf 'No running services found.\n'; return; }
+	for service in "${services[@]}"; do
+		if ssh_service_protected "$service"; then printf 'PROTECTED: %s\n' "$service"
+		elif reason="$(ssh_service_review_reason "$service")"; then printf 'REVIEW: %s (%s; verify it is not required)\n' "$service" "$reason"
+		else printf 'RUNNING: %s (review manually if unexpected)\n' "$service"; fi
+	done
+	for service in "${services[@]}"; do
+		ssh_service_protected "$service" && continue
+		reason="$(ssh_service_review_reason "$service")" || continue
+		printf '\nDisable and stop %s (%s)? [y/N]: ' "$service" "$reason"
+		IFS= read -r answer || true
+		case "$answer" in y|Y|yes|YES) systemctl disable --now "$service" && printf 'Disabled/stopped %s.\n' "$service" || printf 'Could not disable %s.\n' "$service" >&2 ;; *) printf 'Left unchanged.\n' ;; esac
+	done
+}
+
+run_system_review() {
+	local choice
+	if ((EUID != 0)); then printf 'Review mode: some checks need root.\n'; fi
+	while true; do
+		printf '\n=== System and SSH Review ===\n1) Run system audit\n2) Run detailed SSH audit\n3) Apply SSH login baseline\n4) Ensure SSH enabled/active\n5) Audit running services and review candidates\n0) Back\n'
+		read -r -p 'Select: ' choice || return
+		case "$choice" in
+			1) ssh_check_platform; ssh_check_service; ssh_audit_security; ssh_check_login_manager; ssh_check_updates; ssh_check_scoreengine ;;
+			2) ssh_audit_security ;;
+			3) ssh_apply_baseline ;;
+			4) ssh_ensure_enabled ;;
+			5) ssh_audit_services ;;
+			0|q|Q) return ;;
+			*) printf 'Invalid selection.\n' ;;
+		esac
+		noje_pause
+	done
+}
+
+###############################################################################
+# Malware, persistence, temporary executable, and media review
+###############################################################################
+
+malware_is_protected_path() { [[ "${1,,}" == *scoreengine* ]]; }
+
+malware_collect_media() {
+	find /home -xdev -type f \( -iname '*.avi' -o -iname '*.flac' -o -iname '*.gif' -o -iname '*.jpeg' -o -iname '*.jpg' -o -iname '*.m4a' -o -iname '*.mkv' -o -iname '*.mov' -o -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.png' -o -iname '*.wav' -o -iname '*.webm' -o -iname '*.zip' -o -iname '*.tar' -o -iname '*.tar.gz' -o -iname '*.tgz' -o -iname '*.7z' -o -iname '*.rar' -o -iname '*.iso' -o -iname '*.dmg' -o -iname '*.exe' -o -iname '*.msi' \) -print0 2>/dev/null
+}
+
+malware_review_media() {
+	local file answer
+	local -a files=()
+	while IFS= read -r -d '' file; do files+=("$file"); done < <(malware_collect_media)
+	printf '\n=== User-home media/archive candidates ===\n'
+	((${#files[@]})) || { printf 'No matching files found under /home.\n'; return; }
+	for file in "${files[@]}"; do
+		if malware_is_protected_path "$file"; then printf 'PROTECTED: %s\n' "$file"; continue; fi
+		printf '\nCandidate: %s\n' "$file"
+		stat -c 'Size: %s bytes | Modified: %y | Owner: %U:%G | Mode: %A' -- "$file" 2>/dev/null || true
+		command -v file >/dev/null 2>&1 && printf 'Detected MIME type: %s\n' "$(file --brief --mime-type -- "$file" 2>/dev/null || printf unknown)"
+		printf 'Delete? Type DELETE to confirm: '
+		IFS= read -r answer || true
+		if [[ "$answer" == DELETE ]]; then if rm -f -- "$file" && [[ ! -e "$file" ]]; then printf 'Deleted and verified.\n'; else printf 'Could not verify deletion.\n' >&2; fi; else printf 'Kept.\n'; fi
+	done
+}
+
+malware_scan_names() {
+	local path
+	local -a paths=()
+	while IFS= read -r -d '' path; do paths+=("$path"); done < <(find /home /tmp /var/tmp /dev/shm -xdev \( -iname '*keylog*' -o -iname '*rootkit*' -o -iname '*meterpreter*' -o -iname '*payload*' -o -iname '*exploit*' -o -iname '*backdoor*' -o -iname '*cryptominer*' -o -iname '*reverse-shell*' -o -iname '*bind-shell*' \) -print0 2>/dev/null)
+	printf '\n=== Suspicious filename review ===\n'
+	if ((${#paths[@]} == 0)); then printf 'No filename matches; this does not prove the system clean.\n'; return; fi
+	for path in "${paths[@]}"; do malware_is_protected_path "$path" && printf 'PROTECTED: %s\n' "$path" || printf 'REVIEW MANUALLY (name heuristic only): %s\n' "$path"; done
+}
+
+malware_collect_persistence() {
+	local directory file
+	for file in /etc/crontab /etc/rc.local /etc/profile; do [[ -f "$file" ]] && printf '%s\0' "$file"; done
+	for directory in /etc/cron.d /etc/systemd/system /etc/profile.d /home; do
+		[[ -d "$directory" ]] || continue
+		find "$directory" -xdev -type f \( -path '/etc/cron.d/*' -o -path '/etc/systemd/system/*.service' -o -path '/etc/profile.d/*.sh' -o -path '*/.config/autostart/*.desktop' -o -path '*/.config/systemd/user/*.service' -o -name '.bashrc' -o -name '.profile' -o -name '.bash_profile' \) -print0 2>/dev/null
+	done
+}
+
+malware_review_persistence() {
+	local file reviewed=0 flagged=0
+	local -a files=()
+	while IFS= read -r -d '' file; do files+=("$file"); done < <(malware_collect_persistence)
+	printf '\n=== Startup and persistence review ===\n'
+	((${#files[@]})) || { printf 'No selected persistence files found.\n'; return; }
+	for file in "${files[@]}"; do
+		reviewed=$((reviewed + 1))
+		if grep -Eiq 'curl|wget|base64[[:space:]]+-d|/dev/tcp|/dev/shm|/tmp/|nohup|socat.*exec|nc[[:space:]].*-e|python[0-9]*[[:space:]]+-c|bash[[:space:]]+-c' "$file" 2>/dev/null; then printf 'REVIEW: possible download/execution pattern in %s\n' "$file"; flagged=$((flagged + 1)); fi
+	done
+	printf 'Reviewed %d file(s); heuristic matches %d. Inspect manually; legitimate files may match.\n' "$reviewed" "$flagged"
+}
+
+malware_review_temp_executables() {
+	local file
+	local -a files=()
+	while IFS= read -r -d '' file; do files+=("$file"); done < <(find /tmp /var/tmp /dev/shm -xdev -type f -perm /111 -print0 2>/dev/null)
+	printf '\n=== Executables in temporary paths ===\n'
+	((${#files[@]})) || { printf 'No executable files found.\n'; return; }
+	for file in "${files[@]}"; do
+		if malware_is_protected_path "$file"; then printf 'PROTECTED: %s\n' "$file"; else printf 'REVIEW MANUALLY: %s\n' "$file"; stat -c '  Size: %s | Owner: %U:%G | Mode: %A | Modified: %y' -- "$file" 2>/dev/null || true; fi
+	done
+	printf 'Temporary-path executables are suspicious context, not proof of malware.\n'
+}
+
+malware_run_clamav() {
+	local status
+	command -v clamscan >/dev/null 2>&1 || { printf 'ClamAV is not installed; no scanner was installed.\n'; return 1; }
+	noje_require_root || return 1
+	printf 'Scanning /home, /tmp, /var/tmp, /dev/shm. No files will be deleted.\n'
+	clamscan --recursive --infected --no-summary /home /tmp /var/tmp /dev/shm
+	status=$?
+	case "$status" in 0) printf 'No detections reported.\n' ;; 1) printf 'Detections reported; inspect output. No files removed.\n' ;; *) printf 'Scan may be incomplete (status %d).\n' "$status" ;; esac
+}
+
+malware_check_scoreengine() {
+	local process
+	process="$(pgrep -af scoreengine 2>/dev/null || true)"
+	[[ -n "$process" ]] && printf 'scoreengine detected and left untouched.\n' || printf 'scoreengine not detected; nothing changed.\n'
+}
+
+run_malware_review() {
+	local choice
+	while true; do
+		printf '\n=== Malware and Unnecessary File Review ===\n1) Review suspicious names and persistence\n2) Review/delete user media and archives\n3) Review executables in temporary locations\n4) ClamAV scan if installed\n5) Check scoreengine\n0) Back\n'
+		read -r -p 'Select: ' choice || return
+		case "$choice" in
+			1) malware_scan_names; malware_review_persistence ;;
+			2) malware_review_media ;;
+			3) malware_review_temp_executables ;;
+			4) malware_run_clamav ;;
+			5) malware_check_scoreengine ;;
+			0|q|Q) return ;;
+			*) printf 'Invalid selection.\n' ;;
+		esac
+		noje_pause
+	done
+}
+
+###############################################################################
+# Software review and Chrome setup
+###############################################################################
+
+software_list_suspicious_packages() {
+	dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | grep -Ei 'aircrack|burpsuite|hashcat|hydra|john|metasploit|ncat|netcat|nikto|nmap|scapy|sqlmap|wireshark|zenmap' || true
+}
+
+software_review_suspicious_packages() {
+	local package answer
+	local -a packages=()
+	while IFS= read -r package; do [[ -n "$package" ]] && packages+=("$package"); done < <(software_list_suspicious_packages)
+	printf '\n=== Potentially Unauthorized Security Tools ===\n'
+	((${#packages[@]})) || { printf 'No known tool packages detected.\n'; return; }
+	for package in "${packages[@]}"; do
+		[[ "${package,,}" == *scoreengine* ]] && { printf 'Protected: %s\n' "$package"; continue; }
+		printf 'Found package: %s. Purge? [y/N]: ' "$package"
+		IFS= read -r answer || true
+		case "$answer" in y|Y|yes|YES) noje_require_root && apt-get purge "$package" ;; *) printf 'Kept %s.\n' "$package" ;; esac
+	done
+}
+
+software_check_chrome() {
+	local installed account uid gid home shell mime browser mismatches
+	local -a mimes=(x-scheme-handler/http x-scheme-handler/https text/html application/xhtml+xml)
+	installed='no'
+	dpkg-query -W -f='${Status}' google-chrome-stable 2>/dev/null | grep -q '^install ok installed$' && installed='yes'
+	printf '\n=== Google Chrome ===\nInstalled: %s\n' "$installed"
+	[[ "$installed" == yes ]] || printf 'WARN: Google Chrome is not installed.\n'
+	command -v xdg-mime >/dev/null 2>&1 || { printf 'xdg-mime unavailable; defaults not checked.\n'; return 1; }
+	if ((EUID == 0)); then
+		command -v runuser >/dev/null 2>&1 || return 1
+		while IFS=: read -r account _ uid gid _ home shell; do
+			[[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1000 && uid != 65534)) && [[ "$home" == /home/* && -d "$home" && "$shell" != */nologin && "$shell" != */false ]] || continue
+			printf '\nDefaults for %s:\n' "$account"
+			mismatches=0
+			for mime in "${mimes[@]}"; do browser="$(runuser -u "$account" -- env HOME="$home" XDG_CONFIG_HOME="$home/.config" xdg-mime query default "$mime" 2>/dev/null || true)"; printf '  %-32s %s\n' "$mime" "${browser:-not set}"; [[ "$browser" == google-chrome.desktop ]] || mismatches=$((mismatches + 1)); done
+			printf '  Non-Chrome default count: %d\n' "$mismatches"
+		done < <(getent passwd)
+	else
+		printf 'Current-user HTTPS default: %s\n' "$(xdg-mime query default x-scheme-handler/https 2>/dev/null || printf 'not set')"
+		printf 'Run as root to inspect all eligible accounts.\n'
+	fi
+}
+
+software_install_chrome() (
+	local distro_id=unknown distro_version=unknown architecture temp_dir key_file keyring repo_url repo_file fingerprint
+	noje_require_root || return 1
+	[[ -r /etc/os-release ]] || return 1
+	. /etc/os-release
+	distro_id="${ID:-unknown}"; distro_version="${VERSION_ID:-unknown}"
+	[[ "$distro_id" == ubuntu && "$distro_version" == 24.04 ]] || { printf 'Chrome installer supports Ubuntu 24.04 only; found %s %s.\n' "$distro_id" "$distro_version"; return 1; }
+	architecture="$(dpkg --print-architecture)"
+	[[ "$architecture" == amd64 ]] || { printf 'Google Chrome requires amd64; found %s.\n' "$architecture"; return 1; }
+	if ! command -v gpg >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg || return 1; fi
+	temp_dir="$(mktemp -d)" || return 1
+	trap 'rm -rf -- "$temp_dir"' EXIT
+	key_file="$temp_dir/google-linux-signing-key.pub"; keyring='/etc/apt/keyrings/google-chrome.gpg'; repo_url='https://dl.google.com/linux/chrome/deb'; repo_file='/etc/apt/sources.list.d/google-chrome-noje.list'; fingerprint='EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796'
+	curl -fsSL --retry 3 https://dl.google.com/linux/linux_signing_key.pub -o "$key_file" || return 1
+	gpg --show-keys --with-colons "$key_file" 2>/dev/null | awk -F: -v expected="$fingerprint" '$1 == "fpr" && $10 == expected { found=1 } END { exit !found }' || { printf 'Google signing-key fingerprint verification failed.\n' >&2; return 1; }
+	install -d -m 0755 /etc/apt/keyrings || return 1
+	gpg --dearmor --output "$temp_dir/google-chrome.gpg" "$key_file" || return 1
+	install -m 0644 "$temp_dir/google-chrome.gpg" "$keyring" || return 1
+	if ! grep -RqsF -- "$repo_url" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then printf 'deb [arch=amd64 signed-by=%s] %s stable main\n' "$keyring" "$repo_url" > "$temp_dir/google-chrome.list"; install -m 0644 "$temp_dir/google-chrome.list" "$repo_file" || return 1; fi
+	apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y google-chrome-stable xdg-utils || return 1
+	[[ -f /usr/share/applications/google-chrome.desktop ]] || { printf 'Chrome launcher missing.\n'; return 1; }
+	printf 'Google Chrome installed system-wide.\n'
+)
+
+software_set_chrome_defaults() {
+	local account uid gid home shell config_dir failures=0 configured=0 answer
+	noje_require_root || return 1
+	command -v runuser >/dev/null 2>&1 && command -v xdg-mime >/dev/null 2>&1 || { printf 'runuser and xdg-mime are required.\n'; return 1; }
+	if ! dpkg-query -W -f='${Status}' google-chrome-stable 2>/dev/null | grep -q '^install ok installed$'; then software_install_chrome || return 1; fi
+	printf 'Set Chrome as default for existing interactive /home accounts? [y/N]: '
+	IFS= read -r answer || true
+	case "$answer" in y|Y|yes|YES) ;; *) printf 'Defaults unchanged.\n'; return 0 ;; esac
+	while IFS=: read -r account _ uid gid _ home shell; do
+		[[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1000 && uid != 65534)) && [[ "$home" == /home/* && -d "$home" && "$shell" != */nologin && "$shell" != */false ]] || continue
+		config_dir="$home/.config"
+		if [[ ! -d "$config_dir" ]] && ! install -d -o "$uid" -g "$gid" -m 0755 "$config_dir"; then failures=$((failures + 1)); continue; fi
+		if runuser -u "$account" -- env HOME="$home" XDG_CONFIG_HOME="$config_dir" xdg-mime default google-chrome.desktop x-scheme-handler/http x-scheme-handler/https text/html application/xhtml+xml; then printf 'Chrome set as default for %s.\n' "$account"; configured=$((configured + 1)); else printf 'Could not set default for %s.\n' "$account" >&2; failures=$((failures + 1)); fi
+	done < <(getent passwd)
+	printf 'Configured %d account(s); failures: %d.\n' "$configured" "$failures"
+	((configured > 0 && failures == 0))
+}
+
+software_update_packages() {
+	local answer ssh_service
+	noje_require_root || return 1
+	command -v apt-get >/dev/null 2>&1 || return 1
+	printf 'Updates can restart services. Run apt-get update and upgrade? [y/N]: '
+	IFS= read -r answer || true
+	case "$answer" in y|Y|yes|YES) ;; *) printf 'Update cancelled.\n'; return 0 ;; esac
+	apt-get update && apt-get upgrade || { printf 'Package update failed.\n' >&2; return 1; }
+	ssh_service="$(ssh_service_name)"
+	if [[ -z "$ssh_service" ]]; then printf 'SSH service unit not found after update.\n'; return 0; fi
+	if systemctl is-active --quiet "$ssh_service" && systemctl is-enabled --quiet "$ssh_service"; then printf 'SSH remains enabled and active.\n'; else printf 'SSH is not both enabled and active. Enable/start now? [y/N]: '; IFS= read -r answer || true; case "$answer" in y|Y|yes|YES) systemctl enable --now "$ssh_service" ;; *) printf 'SSH unchanged.\n' ;; esac; fi
+}
+
+software_audit() {
+	printf '\n=== Software Review ===\n'
+	printf 'Installed package count: '; dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | wc -l
+	software_review_suspicious_packages
+	software_check_chrome
+}
+
+run_software_review() {
+	local choice
+	while true; do
+		printf '\n=== Software Review ===\n1) Audit software and Chrome defaults\n2) Review/remove known security-tool packages\n3) Check Chrome defaults\n4) Install Chrome and set defaults for all users\n5) Update Ubuntu packages\n0) Back\n'
+		read -r -p 'Select: ' choice || return
+		case "$choice" in
+			1) software_audit ;;
+			2) software_review_suspicious_packages ;;
+			3) software_check_chrome ;;
+			4) software_set_chrome_defaults ;;
+			5) software_update_packages ;;
+			0|q|Q) return ;;
+			*) printf 'Invalid selection.\n' ;;
+		esac
+		noje_pause
+	done
+}
+
+###############################################################################
+# .bashrc comparison
+###############################################################################
+
+bashrc_check() {
+	local reference='/etc/skel/.bashrc' file checked=0 different=0 errors=0
+	local -a files=()
+	if ((EUID != 0)); then
+		command -v sudo >/dev/null 2>&1 || { printf 'sudo required to inspect all users.\n'; return 1; }
+		exec sudo -- bash "$(readlink -f -- "${BASH_SOURCE[0]}")" --bashrc-check
+	fi
+	[[ -r "$reference" ]] || { printf 'Reference file unreadable: %s\n' "$reference"; return 1; }
+	while IFS= read -r -d '' file; do files+=("$file"); done < <(find /home -type f -name .bashrc -print0 2>/dev/null)
+	printf '\nReference: %s\n' "$reference"
+	((${#files[@]})) || { printf 'No .bashrc files found under /home.\n'; return 0; }
+	for file in "${files[@]}"; do
+		checked=$((checked + 1))
+		if diff -q -- "$reference" "$file" >/dev/null 2>&1; then printf 'MATCH: %s\n' "$file"
+		else case "$?" in 1) different=$((different + 1)); printf '\nDIFFERS: %s\n' "$file"; diff -u -- "$reference" "$file" || true ;; *) errors=$((errors + 1)); printf 'ERROR comparing %s\n' "$file" >&2 ;; esac; fi
+	done
+	printf '\nChecked: %d | Different: %d | Errors: %d\n' "$checked" "$different" "$errors"
+	printf 'Read-only comparison; differences are not proof of compromise.\n'
+	((errors == 0))
+}
+
+###############################################################################
+# Main menu
+###############################################################################
+
+noje_main() {
+	local choice
+	while true; do
+		printf '\n=== NOJE Linux Security Toolkit (Single File) ===\n'
+		printf '1) User audit and management\n'
+		printf '2) Password policy\n'
+		printf '3) System and SSH review\n'
+		printf '4) Malware and unnecessary-file review\n'
+		printf '5) Software review\n'
+		printf '6) Bashrc check\n'
+		printf '0) Exit\n'
+		read -r -p 'Select: ' choice || return
+		case "$choice" in
+			1) run_user_audit ;;
+			2) run_password_policy ;;
+			3) run_system_review ;;
+			4) run_malware_review ;;
+			5) run_software_review ;;
+			6) bashrc_check ;;
+			0|q|Q) printf 'Exiting.\n'; return 0 ;;
+			*) printf 'Invalid selection.\n' ;;
+		esac
+		noje_pause
+	done
+}
+
+if [[ "${1:-}" == '--bashrc-check' ]]; then
+	bashrc_check
+else
+	noje_main "$@"
+fi
+# End of single-file toolkit.
+:
 
