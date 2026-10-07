@@ -49,22 +49,61 @@ review_suspicious_packages() {
 }
 
 check_chrome() {
-	local installed default_browser
+	local installed account uid gid home shell mime default_browser mismatches checked=0
+	local -a browser_mimes=(x-scheme-handler/http x-scheme-handler/https text/html application/xhtml+xml)
 	installed='no'
-	default_browser='unknown'
 
 	if command -v google-chrome >/dev/null 2>&1 || dpkg-query -W google-chrome-stable >/dev/null 2>&1; then
 		installed='yes'
 	fi
-	if command -v xdg-settings >/dev/null 2>&1; then
-		default_browser="$(xdg-settings get default-web-browser 2>/dev/null || true)"
-	fi
 
 	printf '\n=== Google Chrome ===\n'
 	printf 'Installed: %s\n' "$installed"
-	printf 'Default browser: %s\n' "$default_browser"
 	[[ "$installed" == 'yes' ]] || printf 'WARN: google-chrome-stable is not installed.\n'
-	[[ "$default_browser" == 'google-chrome.desktop' ]] || printf 'WARN: Google Chrome is not confirmed as the default browser for this user.\n'
+	command -v xdg-mime >/dev/null 2>&1 || { printf 'xdg-mime is unavailable; browser defaults could not be checked.\n'; return 1; }
+
+	if ((EUID == 0)); then
+		command -v runuser >/dev/null 2>&1 || { printf 'runuser is unavailable; per-user defaults could not be checked.\n'; return 1; }
+		while IFS=: read -r account _ uid gid _ home shell; do
+			[[ "$uid" =~ ^[0-9]+$ ]] || continue
+			((uid >= 1000 && uid != 65534)) || continue
+			[[ "$home" == /home/* && -d "$home" ]] || continue
+			[[ "$shell" != */nologin && "$shell" != */false ]] || continue
+
+			printf '\nDefaults for %s:\n' "$account"
+			mismatches=0
+			for mime in "${browser_mimes[@]}"; do
+				default_browser="$(runuser -u "$account" -- env HOME="$home" XDG_CONFIG_HOME="$home/.config" xdg-mime query default "$mime" 2>/dev/null || true)"
+				printf '  %-32s %s\n' "$mime" "${default_browser:-not set}"
+				[[ "$default_browser" == 'google-chrome.desktop' ]] || mismatches=$((mismatches + 1))
+			done
+			if ((mismatches == 0)); then
+				printf '  Google Chrome is the default for all checked types.\n'
+			else
+				printf '  WARN: Google Chrome is not the default for %d checked type(s).\n' "$mismatches"
+			fi
+			checked=$((checked + 1))
+		done < <(getent passwd)
+	else
+		account="$(id -un)"
+		home="$HOME"
+		printf '\nDefaults for current user %s:\n' "$account"
+		mismatches=0
+		for mime in "${browser_mimes[@]}"; do
+			default_browser="$(xdg-mime query default "$mime" 2>/dev/null || true)"
+			printf '  %-32s %s\n' "$mime" "${default_browser:-not set}"
+			[[ "$default_browser" == 'google-chrome.desktop' ]] || mismatches=$((mismatches + 1))
+		done
+		if ((mismatches == 0)); then
+			printf '  Google Chrome is the default for all checked types.\n'
+		else
+			printf '  WARN: Google Chrome is not the default for %d checked type(s).\n' "$mismatches"
+		fi
+		checked=1
+		printf 'Run Software Review as root to inspect all eligible accounts.\n'
+	fi
+
+	((checked > 0)) || printf 'No eligible interactive accounts with /home directories were found.\n'
 }
 
 set_chrome_default() {
@@ -257,7 +296,7 @@ while true; do
 	printf '\n=== Software Review ===\n'
 	printf '1) Audit installed software\n'
 	printf '2) Review and remove suspicious tools\n'
-	printf '3) Check Google Chrome/default browser\n'
+	printf '3) Check Chrome defaults for users\n'
 	printf '4) Install Chrome and set default for all users\n'
 	printf '5) Update Ubuntu packages\n'
 	printf '0) Back\n'
