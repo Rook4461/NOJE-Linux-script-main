@@ -16,8 +16,8 @@ Keep each function self-contained and review its behavior before running it with
 
 1. Run the user audit and verify authorized accounts and administrator group membership.
 2. Apply the password policy, then use the password submenu to update only the intended accounts.
-3. Run the system audit and review running services. The service audit protects SSH and `scoreengine`; disable a flagged service only after confirming it is not required.
+3. Run the system and detailed SSH audits. The SSH baseline disables root and empty-password SSH login and limits attempts, but leaves regular-user password authentication unchanged. Review services; SSH and `scoreengine` are protected from service removal.
 4. Review software and remove only confirmed unauthorized tools. In Software Review, use the Chrome setup action to install Google Chrome system-wide and set it as the default for existing interactive accounts with homes under `/home`.
-5. Review user-home media and suspicious paths. Confirm every removal and verify the file is gone.
+5. Review suspicious filenames, startup persistence, and executables in temporary directories; optionally run ClamAV if installed. Treat matches as leads, not proof of malware. Review media/archive metadata and type `DELETE` before removing any file.
 
 The plugins protect the authorized accounts listed in the competition scenario from deletion or administrator-rights removal. They do not automatically decide whether an unknown package or media file is business-critical.

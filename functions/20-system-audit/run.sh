@@ -8,9 +8,9 @@ fail() {
 }
 
 service_name() {
-	if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+	if systemctl list-unit-files --no-legend ssh.service 2>/dev/null | grep -q '^ssh\.service'; then
 		printf 'ssh'
-	elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+	elif systemctl list-unit-files --no-legend sshd.service 2>/dev/null | grep -q '^sshd\.service'; then
 		printf 'sshd'
 	else
 		printf ''
@@ -56,20 +56,114 @@ check_ssh() {
 	fi
 }
 
-check_root_login() {
-	local permit_root_login root_state
-	permit_root_login='unknown'
-	root_state='unknown'
+audit_ssh_key_permissions() {
+	local key path owner mode account
+	local -a private_host_keys=()
+	local -a user_ssh_paths=()
 
-	if command -v sshd >/dev/null 2>&1; then
-		permit_root_login="$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" { print $2; exit }')"
+	printf '\n--- SSH host private-key permissions ---\n'
+	for key in /etc/ssh/ssh_host_*_key; do
+		[[ -f "$key" ]] || continue
+		private_host_keys+=("$key")
+	done
+	if ((${#private_host_keys[@]} == 0)); then
+		printf 'WARN: No SSH host private keys were found.\n'
+	else
+		for key in "${private_host_keys[@]}"; do
+			owner="$(stat -c '%U' -- "$key" 2>/dev/null || printf 'unknown')"
+			mode="$(stat -c '%a' -- "$key" 2>/dev/null || printf 'unknown')"
+			if [[ "$owner" == 'root' ]] && ! find "$key" -maxdepth 0 -perm /077 -print -quit 2>/dev/null | grep -q .; then
+				printf 'PASS: %s is root-owned with no group/other permissions (mode %s).\n' "$key" "$mode"
+			else
+				printf 'WARN: Review host key owner/mode: %s (%s, mode %s).\n' "$key" "$owner" "$mode"
+			fi
+		done
 	fi
+
+	printf '\n--- User SSH directory/key permissions ---\n'
+	for path in /home/*; do
+		[[ -d "$path" ]] || continue
+		account="${path##*/}"
+		for key in "$path/.ssh" "$path/.ssh/authorized_keys" "$path/.ssh/authorized_keys2"; do
+			[[ -e "$key" ]] || continue
+			user_ssh_paths+=("$account|$key")
+		done
+	done
+	if ((${#user_ssh_paths[@]} == 0)); then
+		printf 'No user .ssh directories or authorized_keys files found under /home.\n'
+		return
+	fi
+	for path in "${user_ssh_paths[@]}"; do
+		IFS='|' read -r account key <<< "$path"
+		owner="$(stat -c '%U' -- "$key" 2>/dev/null || printf 'unknown')"
+		mode="$(stat -c '%a' -- "$key" 2>/dev/null || printf 'unknown')"
+		if [[ "$owner" != "$account" ]] || find "$key" -maxdepth 0 -perm /077 -print -quit 2>/dev/null | grep -q .; then
+			printf 'WARN: Review %s (%s, mode %s); recommended owner is %s, with no group/other access.\n' "$key" "$owner" "$mode" "$account"
+		else
+			printf 'PASS: %s has owner-only permissions (mode %s).\n' "$key" "$mode"
+		fi
+	done
+}
+
+audit_ssh_security() {
+	local effective root_login empty_passwords password_auth pubkey_auth max_auth_tries
+	local ciphers macs kex root_state
+
+	if ! command -v sshd >/dev/null 2>&1; then
+		printf 'OpenSSH server is not installed; SSH configuration cannot be audited.\n'
+		return 1
+	fi
+	effective="$(sshd -T 2>/dev/null)" || {
+		printf 'Could not read effective sshd configuration; run this audit as root and check sshd_config syntax.\n' >&2
+		return 1
+	}
+	root_login="$(awk '$1 == "permitrootlogin" { print $2; exit }' <<< "$effective")"
+	empty_passwords="$(awk '$1 == "permitemptypasswords" { print $2; exit }' <<< "$effective")"
+	password_auth="$(awk '$1 == "passwordauthentication" { print $2; exit }' <<< "$effective")"
+	pubkey_auth="$(awk '$1 == "pubkeyauthentication" { print $2; exit }' <<< "$effective")"
+	max_auth_tries="$(awk '$1 == "maxauthtries" { print $2; exit }' <<< "$effective")"
+	ciphers="$(awk '$1 == "ciphers" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$effective")"
+	macs="$(awk '$1 == "macs" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$effective")"
+	kex="$(awk '$1 == "kexalgorithms" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$effective")"
 	root_state="$(passwd -S root 2>/dev/null | awk '{ print $2 }')"
 
-	printf 'SSH PermitRootLogin: %s\n' "${permit_root_login:-unknown}"
-	printf 'Root password state: %s\n' "${root_state:-unknown}"
-	[[ "$permit_root_login" == 'no' ]] && printf 'PASS: Root SSH login is disabled.\n' || printf 'WARN: Root SSH login is not confirmed disabled.\n'
-	[[ "$root_state" == 'L' || "$root_state" == 'LK' ]] && printf 'PASS: Root password is locked.\n' || printf 'WARN: Root password is not confirmed locked.\n'
+	printf '\n=== Effective SSH Security Settings ===\n'
+	printf 'PermitRootLogin: %s\n' "${root_login:-unknown}"
+	[[ "$root_login" == 'no' ]] && printf 'PASS: Root SSH login is disabled.\n' || printf 'WARN: Root SSH login is not fully disabled.\n'
+	printf 'PermitEmptyPasswords: %s\n' "${empty_passwords:-unknown}"
+	[[ "$empty_passwords" == 'no' ]] && printf 'PASS: Empty-password SSH login is disabled.\n' || printf 'WARN: Empty-password SSH login is not disabled.\n'
+	printf 'Root account password state: %s\n' "${root_state:-unknown}"
+	[[ "$root_state" == 'L' || "$root_state" == 'LK' ]] && printf 'PASS: Root account password is locked.\n' || printf 'WARN: Root account password is not confirmed locked.\n'
+	printf 'PasswordAuthentication: %s (left unchanged to avoid locking out required users)\n' "${password_auth:-unknown}"
+	printf 'PubkeyAuthentication: %s\n' "${pubkey_auth:-unknown}"
+	[[ "$pubkey_auth" == 'yes' ]] && printf 'PASS: Public-key authentication is enabled.\n' || printf 'WARN: Public-key authentication is not enabled.\n'
+	printf 'MaxAuthTries: %s\n' "${max_auth_tries:-unknown}"
+	if [[ "$max_auth_tries" =~ ^[0-9]+$ ]] && ((max_auth_tries <= 4)); then
+		printf 'PASS: MaxAuthTries is 4 or lower.\n'
+	else
+		printf 'WARN: Consider limiting MaxAuthTries to 4 after reviewing access requirements.\n'
+	fi
+
+	printf '\nEffective ciphers: %s\n' "${ciphers:-unknown}"
+	if grep -Eiq '(^|,)(3des-cbc|aes(128|192|256)-cbc)(,|$)' <<< "$ciphers"; then
+		printf 'WARN: A legacy CBC/3DES cipher is enabled.\n'
+	else
+		printf 'PASS: No CBC/3DES cipher from the review list is enabled.\n'
+	fi
+	printf 'Effective MACs: %s\n' "${macs:-unknown}"
+	if grep -Eiq '(^|,)(hmac-md5(-96)?(-etm@openssh\.com)?|hmac-sha1(-96)?(-etm@openssh\.com)?|umac-64(@openssh\.com|-etm@openssh\.com)?)(,|$)' <<< "$macs"; then
+		printf 'WARN: A legacy MAC from the review list is enabled.\n'
+	else
+		printf 'PASS: No MD5/SHA1/64-bit UMAC MAC from the review list is enabled.\n'
+	fi
+	printf 'Effective key exchanges: %s\n' "${kex:-unknown}"
+	if grep -Eiq 'diffie-hellman-(group1-sha1|group14-sha1|group-exchange-sha1)' <<< "$kex"; then
+		printf 'WARN: A SHA-1/legacy Diffie-Hellman key exchange is enabled.\n'
+	else
+		printf 'PASS: No SHA-1/legacy Diffie-Hellman group from the review list is enabled.\n'
+	fi
+	printf 'OpenSSH on Ubuntu 24.04 supports SSH protocol 2 only; no Protocol directive is needed.\n'
+	audit_ssh_key_permissions
 }
 
 check_login_manager() {
@@ -110,7 +204,7 @@ audit_system() {
 	check_platform
 	printf '\n--- SSH ---\n'
 	check_ssh
-	check_root_login
+	audit_ssh_security
 	printf '\n--- Login manager ---\n'
 	check_login_manager
 	printf '\n--- Package updates ---\n'
@@ -119,32 +213,69 @@ audit_system() {
 	check_scoreengine
 }
 
-disable_root_ssh() {
-	local service backup config
+apply_ssh_login_baseline() {
+	local service config_dir config dropin backup temp effective root_login empty_passwords max_auth_tries answer had_dropin=0
 	service="$(service_name)"
 	config='/etc/ssh/sshd_config'
+	config_dir='/etc/ssh/sshd_config.d'
+	dropin="$config_dir/00-noje-hardening.conf"
 
 	((EUID == 0)) || { printf 'Run this action as root.\n'; return 1; }
 	[[ -n "$service" ]] || { printf 'SSH service was not found; no changes made.\n'; return 1; }
 	systemctl is-active --quiet "$service" || { printf 'SSH is not active; no configuration change made.\n'; return 1; }
 	[[ -f "$config" ]] || { printf '%s was not found.\n' "$config"; return 1; }
+	[[ -d "$config_dir" ]] || { printf '%s was not found; no configuration change made.\n' "$config_dir"; return 1; }
+	grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' "$config" || {
+		printf 'The Ubuntu SSH drop-in include was not found; no configuration change made.\n'
+		return 1
+	}
 
-	backup="${config}.noje-backup-$(date +%Y%m%d%H%M%S)"
-	cp -p "$config" "$backup" || return 1
-	if grep -Eq '^[[:space:]]*#?[[:space:]]*PermitRootLogin[[:space:]]+' "$config"; then
-		sed -i -E 's|^[[:space:]]*#?[[:space:]]*PermitRootLogin[[:space:]]+.*|PermitRootLogin no|' "$config"
-	else
-		printf '\nPermitRootLogin no\n' >> "$config"
+	printf "This disables root and empty-password SSH login and limits authentication attempts to four. Other users' password authentication is unchanged.\n"
+	printf 'Continue? [y/N]: '
+	IFS= read -r answer || true
+	case "$answer" in
+		y|Y|yes|YES) ;;
+		*) printf 'SSH configuration was not changed.\n'; return 0 ;;
+	esac
+
+	if [[ -e "$dropin" ]]; then
+		had_dropin=1
+		backup="${dropin}.noje-backup-$(date +%Y%m%d%H%M%S)"
+		cp -p "$dropin" "$backup" || { printf 'Could not back up %s.\n' "$dropin" >&2; return 1; }
 	fi
-
-	if sshd -t 2>/dev/null; then
-		systemctl reload "$service"
-		printf 'Root SSH login disabled. SSH remained active. Backup: %s\n' "$backup"
-	else
-		cp -p "$backup" "$config"
-		printf 'sshd rejected the change; configuration was restored.\n'
+	temp="$(mktemp "$config_dir/.noje-hardening.XXXXXX")" || { printf 'Could not create a temporary SSH config file.\n' >&2; return 1; }
+	if ! printf 'PermitRootLogin no\nPermitEmptyPasswords no\nMaxAuthTries 4\n' > "$temp" || ! chmod 0644 "$temp" || ! mv -f -- "$temp" "$dropin"; then
+		rm -f -- "$temp"
+		printf 'Could not install the SSH hardening drop-in.\n' >&2
 		return 1
 	fi
+
+	if ! sshd -t 2>/dev/null; then
+		if ((had_dropin)); then cp -p "$backup" "$dropin"; else rm -f -- "$dropin"; fi
+		printf 'sshd rejected the change; the previous drop-in state was restored.\n' >&2
+		return 1
+	fi
+	effective="$(sshd -T 2>/dev/null)" || effective=''
+	root_login="$(awk '$1 == "permitrootlogin" { print $2; exit }' <<< "$effective")"
+	empty_passwords="$(awk '$1 == "permitemptypasswords" { print $2; exit }' <<< "$effective")"
+	max_auth_tries="$(awk '$1 == "maxauthtries" { print $2; exit }' <<< "$effective")"
+	if [[ "$root_login" != 'no' || "$empty_passwords" != 'no' || "$max_auth_tries" != '4' ]]; then
+		if ((had_dropin)); then cp -p "$backup" "$dropin"; else rm -f -- "$dropin"; fi
+		printf 'Requested values did not become effective; previous drop-in state was restored. Check earlier SSH includes.\n' >&2
+		return 1
+	fi
+
+	if ! systemctl reload "$service"; then
+		if ((had_dropin)); then cp -p "$backup" "$dropin"; else rm -f -- "$dropin"; fi
+		systemctl reload "$service" 2>/dev/null || true
+		printf 'SSH reload failed; the previous drop-in state was restored.\n' >&2
+		return 1
+	fi
+	printf 'SSH login baseline applied; service %s was reloaded and remains active.\n' "$service"
+	if ((had_dropin)); then
+		printf 'Previous drop-in backup: %s\n' "$backup"
+	fi
+	return 0
 }
 
 ensure_ssh_enabled() {
@@ -247,18 +378,20 @@ fi
 while true; do
 	printf '\n=== System Security Review ===\n'
 	printf '1) Run system audit\n'
-	printf '2) Disable root SSH login\n'
+	printf '2) Apply SSH login baseline\n'
 	printf '3) Ensure SSH is enabled and active\n'
 	printf '4) Audit running services and review candidates\n'
+	printf '5) Run detailed SSH security audit\n'
 	printf '0) Back\n'
 	printf 'Select an option: '
 	IFS= read -r choice || break
 
 	case "$choice" in
 		1) audit_system ;;
-		2) disable_root_ssh ;;
+		2) apply_ssh_login_baseline ;;
 		3) ensure_ssh_enabled ;;
 		4) audit_running_services ;;
+		5) audit_ssh_security ;;
 		0|q|Q) break ;;
 		*) printf 'Invalid selection.\n' ;;
 	esac
